@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"github.com/idena-network/idena-go/blockchain/attachments"
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
@@ -65,6 +66,8 @@ func (api *FlipApi) Submit(args FlipSubmitArgs) (FlipSubmitResponse, error) {
 
 	tx, err := api.baseApi.getSignedTx(addr, nil, types.SubmitFlipTx, decimal.Zero, decimal.Zero, decimal.Zero, 0, 0, attachments.CreateFlipSubmitAttachment(cid.Bytes(), args.PairId), nil)
 
+	log.Info("Building new flip tx", "hash", tx.Hash().Hex(), "nonce", tx.AccountNonce, "epoch", tx.Epoch)
+
 	if err != nil {
 		return FlipSubmitResponse{}, err
 	}
@@ -78,11 +81,29 @@ func (api *FlipApi) Submit(args FlipSubmitArgs) (FlipSubmitResponse, error) {
 	if err := api.fp.AddNewFlip(flip, true); err != nil {
 		return FlipSubmitResponse{}, err
 	}
-	log.Info("flip submitted", "hash", tx.Hash(), "nonce", tx.AccountNonce)
+
+	log.Info("Flip submitted", "hash", tx.Hash().Hex())
+
 	return FlipSubmitResponse{
 		TxHash: tx.Hash(),
 		Hash:   cid.String(),
 	}, nil
+}
+
+func (api *FlipApi) Delete(ctx context.Context, hash string) (common.Hash, error) {
+	c, err := cid.Decode(hash)
+	if err != nil {
+		return common.Hash{}, errors.New("invalid flip hash")
+	}
+	cidBytes := c.Bytes()
+	addr := api.baseApi.getCurrentCoinbase()
+
+	if txHash, err := api.baseApi.sendTx(ctx, addr, nil, types.DeleteFlipTx, decimal.Zero, decimal.Zero, decimal.Zero,
+		0, 0, attachments.CreateDeleteFlipAttachment(cidBytes), nil); err != nil {
+		return common.Hash{}, err
+	} else {
+		return txHash, nil
+	}
 }
 
 type FlipHashesResponse struct {
@@ -97,6 +118,9 @@ func (api *FlipApi) isCeremonyCandidate() bool {
 }
 
 func (api *FlipApi) ShortHashes() ([]FlipHashesResponse, error) {
+	log.Info("short hashes request")
+	defer log.Info("short hashes response")
+
 	period := api.baseApi.getAppState().State.ValidationPeriod()
 
 	if period != state.FlipLotteryPeriod && period != state.ShortSessionPeriod {
@@ -113,6 +137,9 @@ func (api *FlipApi) ShortHashes() ([]FlipHashesResponse, error) {
 }
 
 func (api *FlipApi) LongHashes() ([]FlipHashesResponse, error) {
+	log.Info("long hashes request")
+	defer log.Info("long hashes response")
+
 	period := api.baseApi.getAppState().State.ValidationPeriod()
 
 	if period != state.FlipLotteryPeriod && period != state.ShortSessionPeriod && period != state.LongSessionPeriod {
@@ -156,6 +183,9 @@ type FlipResponse struct {
 }
 
 func (api *FlipApi) Get(hash string) (FlipResponse, error) {
+	log.Info("get flip request", "hash", hash)
+	defer log.Info("get flip response", "hash", hash)
+
 	c, err := cid.Decode(hash)
 	if err != nil {
 		return FlipResponse{}, err

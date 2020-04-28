@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/common/eventbus"
 	"github.com/idena-network/idena-go/config"
 	"github.com/idena-network/idena-go/events"
@@ -16,6 +17,7 @@ import (
 	"github.com/ipfs/go-ipfs-files"
 	"github.com/ipfs/go-ipfs/core"
 	"github.com/ipfs/go-ipfs/core/coreapi"
+	"github.com/ipfs/go-ipfs/core/corerepo"
 	"github.com/ipfs/go-ipfs/core/coreunix"
 	"github.com/ipfs/go-ipfs/plugin/loader"
 	"github.com/ipfs/go-ipfs/repo/fsrepo"
@@ -32,6 +34,7 @@ import (
 	"github.com/whyrusleeping/go-logging"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -44,12 +47,22 @@ import (
 const (
 	CidLength        = 36
 	ZeroPeersTimeout = 2 * time.Minute
+	GcPeriod         = time.Second * 15
+)
+
+type DataType = uint32
+
+const (
+	Block   DataType = 1
+	Flip    DataType = 2
+	Profile DataType = 3
 )
 
 var (
-	EmptyCid cid.Cid
-	MinCid   [CidLength]byte
-	MaxCid   [CidLength]byte
+	EmptyCid  cid.Cid
+	MinCid    [CidLength]byte
+	MaxCid    [CidLength]byte
+	TooBigErr = errors.New("ipfs data is too big")
 )
 
 func init() {
@@ -62,8 +75,8 @@ func init() {
 }
 
 type Proxy interface {
-	Add(data []byte) (cid.Cid, error)
-	Get(key []byte) ([]byte, error)
+	Add(data []byte, pin bool) (cid.Cid, error)
+	Get(key []byte, dataType DataType) ([]byte, error)
 	LoadTo(key []byte, to io.Writer, ctx context.Context, onLoading func(size, loaded int64)) error
 	Pin(key []byte) error
 	Unpin(key []byte) error
@@ -72,6 +85,7 @@ type Proxy interface {
 	PeerId() string
 	AddFile(absPath string, data io.ReadCloser, fi os.FileInfo) (cid.Cid, error)
 	Host() core2.Host
+	ShouldPin(dataType DataType) bool
 }
 
 type ipfsProxy struct {
@@ -85,6 +99,9 @@ type ipfsProxy struct {
 	nilNode              *core.IpfsNode
 	lastPeersUpdatedTime time.Time
 	bus                  eventbus.Bus
+	lastGcCancel         time.Time
+	gcCancel             context.CancelFunc
+	gcMutex              sync.RWMutex
 }
 
 func (p *ipfsProxy) Host() core2.Host {
@@ -130,6 +147,7 @@ func NewIpfsProxy(cfg *config.IpfsConfig, bus eventbus.Bus) (Proxy, error) {
 	}
 
 	go p.watchPeers()
+	go p.gc()
 	return p, nil
 }
 
@@ -153,8 +171,35 @@ func createNode(cfg *config.IpfsConfig) (*core.IpfsNode, context.Context, contex
 	if err != nil {
 		return nil, nil, func() {}, err
 	}
-
 	return node, ctx, cancelCtx, nil
+}
+
+func (p *ipfsProxy) gc() {
+	for {
+		time.Sleep(GcPeriod)
+		if time.Since(p.lastGcCancel) < GcPeriod {
+			continue
+		}
+		p.gcMutex.Lock()
+		ctx, cancel := context.WithCancel(p.nodeCtx)
+		p.gcCancel = cancel
+		p.gcMutex.Unlock()
+		if err := corerepo.ConditionalGC(ctx, p.node, 0); err != nil {
+			p.log.Debug("ipfs gc error", "err", err)
+		}
+		cancel()
+		p.gcCancel = nil
+		p.lastGcCancel = time.Now()
+	}
+}
+
+func (p *ipfsProxy) cancelGc() {
+	p.lastGcCancel = time.Now()
+	cancelFunc := p.gcCancel
+	if cancelFunc != nil {
+		cancelFunc()
+		p.gcCancel = nil
+	}
 }
 
 func (p *ipfsProxy) changePort() {
@@ -190,7 +235,6 @@ func (p *ipfsProxy) changePort() {
 		p.log.Info("Finish changing IPFS port", "new", p.cfg.IpfsPort)
 		break
 	}
-
 }
 
 func (p *ipfsProxy) watchPeers() {
@@ -215,10 +259,36 @@ func (p *ipfsProxy) watchPeers() {
 	}
 }
 
-func (p *ipfsProxy) Add(data []byte) (cid.Cid, error) {
+func (p *ipfsProxy) ShouldPin(dataType DataType) bool {
+	q := rand.Float32()
+	if dataType == Block {
+		return q <= p.cfg.BlockPinThreshold
+	}
+	if dataType == Flip {
+		return q <= p.cfg.FlipPinThreshold
+	}
+	return true
+}
+
+func (p *ipfsProxy) maxSize(dataType DataType) int64 {
+	switch dataType {
+	case Flip:
+		return common.MaxFlipSize
+	case Profile:
+		return common.MaxProfileSize
+	default:
+		return -1
+	}
+}
+
+func (p *ipfsProxy) Add(data []byte, pin bool) (cid.Cid, error) {
 	if len(data) == 0 {
 		return EmptyCid, nil
 	}
+
+	p.gcMutex.RLock()
+	p.cancelGc()
+	defer p.gcMutex.RUnlock()
 
 	p.rwLock.RLock()
 	defer p.rwLock.RUnlock()
@@ -231,7 +301,7 @@ func (p *ipfsProxy) Add(data []byte) (cid.Cid, error) {
 	var err error
 	for num := 5; num > 0; num-- {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
-		ipfsPath, err = api.Unixfs().Add(ctx, file, options.Unixfs.Pin(true), options.Unixfs.CidVersion(1))
+		ipfsPath, err = api.Unixfs().Add(ctx, file, options.Unixfs.Pin(pin), options.Unixfs.CidVersion(1))
 		select {
 		case <-ctx.Done():
 			err = errors.New("timeout while writing data to ipfs")
@@ -260,6 +330,10 @@ func (p *ipfsProxy) AddFile(absPath string, data io.ReadCloser, fi os.FileInfo) 
 	p.rwLock.RLock()
 	defer p.rwLock.RUnlock()
 
+	p.gcMutex.RLock()
+	p.cancelGc()
+	defer p.gcMutex.RUnlock()
+
 	api, _ := coreapi.NewCoreAPI(p.node)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Hour*1)
@@ -281,7 +355,7 @@ func (p *ipfsProxy) AddFile(absPath string, data io.ReadCloser, fi os.FileInfo) 
 	return path.Cid(), nil
 }
 
-func (p *ipfsProxy) Get(key []byte) ([]byte, error) {
+func (p *ipfsProxy) Get(key []byte, dataType DataType) ([]byte, error) {
 	if len(key) == 0 {
 		return []byte{}, nil
 	}
@@ -292,12 +366,17 @@ func (p *ipfsProxy) Get(key []byte) ([]byte, error) {
 	if c == EmptyCid {
 		return []byte{}, nil
 	}
-	return p.get(path.IpfsPath(c))
+	return p.get(path.IpfsPath(c), dataType)
 }
 
-func (p *ipfsProxy) get(path path.Path) ([]byte, error) {
+func (p *ipfsProxy) get(path path.Path, dataType DataType) ([]byte, error) {
 	p.rwLock.RLock()
 	defer p.rwLock.RUnlock()
+
+	p.gcMutex.RLock()
+	p.cancelGc()
+	defer p.gcMutex.RUnlock()
+
 	api, _ := coreapi.NewCoreAPI(p.node)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
@@ -315,6 +394,17 @@ func (p *ipfsProxy) get(path path.Path) ([]byte, error) {
 	}
 	file := files.ToFile(f)
 	defer file.Close()
+
+	maxSize := p.maxSize(dataType)
+	if maxSize > 0 {
+		size, err := file.Size()
+		if err != nil {
+			return nil, err
+		}
+		if size > maxSize {
+			return nil, TooBigErr
+		}
+	}
 
 	buf := new(bytes.Buffer)
 	_, err = buf.ReadFrom(file)
@@ -340,6 +430,11 @@ func (p *ipfsProxy) LoadTo(key []byte, to io.Writer, ctx context.Context, onLoad
 
 	p.rwLock.RLock()
 	defer p.rwLock.RUnlock()
+
+	p.gcMutex.RLock()
+	p.cancelGc()
+	defer p.gcMutex.RUnlock()
+
 	api, _ := coreapi.NewCoreAPI(p.node)
 
 	f, err := api.Unixfs().Get(ctx, path.IpfsPath(c))
@@ -370,6 +465,10 @@ func (p *ipfsProxy) Pin(key []byte) error {
 		return err
 	}
 
+	p.gcMutex.RLock()
+	p.cancelGc()
+	defer p.gcMutex.RUnlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
 
@@ -394,6 +493,10 @@ func (p *ipfsProxy) Unpin(key []byte) error {
 	if err != nil {
 		return err
 	}
+
+	p.gcMutex.RLock()
+	p.cancelGc()
+	defer p.gcMutex.RUnlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
@@ -548,6 +651,15 @@ func configureIpfs(cfg *config.IpfsConfig) (*ipfsConf.Config, error) {
 		}
 
 		repo, err := fsrepo.Open(datadir)
+
+		if err == fsrepo.ErrNeedMigration {
+			err = Migrate(datadir, fsrepo.RepoVersion)
+			if err != nil {
+				return nil, err
+			}
+			repo, err = fsrepo.Open(datadir)
+		}
+
 		if err != nil {
 			return nil, err
 		}
@@ -592,15 +704,15 @@ func loadPlugins(cfg *config.IpfsConfig) error {
 	plugins, err := loader.NewPluginLoader(pluginPath)
 
 	if err != nil {
-		return errors.New("ipfs plugin loader error")
+		return errors.WithMessage(err, "ipfs plugin loader error")
 	}
 
 	if err := plugins.Initialize(); err != nil {
-		return errors.New("ipfs plugin initialization error")
+		return errors.WithMessage(err, "ipfs plugin initialization error")
 	}
 
 	if err := plugins.Inject(); err != nil {
-		return errors.New("ipfs plugin inject error")
+		return errors.WithMessage(err, "ipfs plugin inject error")
 	}
 
 	return nil
@@ -614,6 +726,10 @@ func NewMemoryIpfsProxy() Proxy {
 
 type memoryIpfs struct {
 	values map[cid.Cid][]byte
+}
+
+func (i *memoryIpfs) ShouldPin(dataType DataType) bool {
+	return true
 }
 
 func (i *memoryIpfs) Host() core2.Host {
@@ -632,13 +748,13 @@ func (i *memoryIpfs) Unpin(key []byte) error {
 	return nil
 }
 
-func (i *memoryIpfs) Add(data []byte) (cid.Cid, error) {
+func (i *memoryIpfs) Add(data []byte, pin bool) (cid.Cid, error) {
 	cid, _ := i.Cid(data)
 	i.values[cid] = data
 	return cid, nil
 }
 
-func (i *memoryIpfs) Get(key []byte) ([]byte, error) {
+func (i *memoryIpfs) Get(key []byte, dataType DataType) ([]byte, error) {
 	if len(key) == 0 {
 		return []byte{}, nil
 	}

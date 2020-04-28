@@ -1,6 +1,7 @@
 package types
 
 import (
+	"bytes"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/crypto"
 	"github.com/idena-network/idena-go/rlp"
@@ -24,12 +25,13 @@ const (
 	ChangeGodAddressTx   uint16 = 0xB
 	BurnTx               uint16 = 0xC
 	ChangeProfileTx      uint16 = 0xD
+	DeleteFlipTx         uint16 = 0xE
 )
 
 const (
-	ReductionOne = 998
-	ReductionTwo = 999
-	Final        = 1000
+	ReductionOne = 253
+	ReductionTwo = 254
+	Final        = 255
 )
 
 type BlockFlag uint32
@@ -68,9 +70,8 @@ type ProposedHeader struct {
 	Time           *big.Int    `json:"timestamp"`
 	TxHash         common.Hash // hash of tx hashes
 	ProposerPubKey []byte
-	Root           common.Hash    // root of state tree
-	IdentityRoot   common.Hash    // root of approved identities tree
-	Coinbase       common.Address // address of proposer
+	Root           common.Hash // root of state tree
+	IdentityRoot   common.Hash // root of approved identities tree
 	Flags          BlockFlag
 	IpfsHash       []byte          // ipfs hash of block body
 	OfflineAddr    *common.Address `rlp:"nil"`
@@ -90,7 +91,7 @@ type TxType = uint16
 
 type VoteHeader struct {
 	Round       uint64
-	Step        uint16
+	Step        uint8
 	ParentHash  common.Hash
 	VotedHash   common.Hash
 	TurnOffline bool
@@ -127,13 +128,31 @@ type Transaction struct {
 	from atomic.Value
 }
 
-type BlockCert struct {
+type FullBlockCert struct {
 	Votes []*Vote
+}
+
+type BlockCertSignature struct {
+	TurnOffline bool
+	Upgrade     uint16
+	Signature   []byte
+}
+
+type BlockCert struct {
+	Round      uint64
+	Step       uint8
+	VotedHash  common.Hash
+	Signatures []*BlockCertSignature
 }
 
 type BlockBundle struct {
 	Block *Block
 	Cert  *BlockCert
+}
+
+type BlockProposal struct {
+	*Block
+	Signature []byte
 }
 
 // Transactions is a Transaction slice type for basic sorting.
@@ -296,7 +315,8 @@ func (h *Header) Coinbase() common.Address {
 	if h.EmptyBlockHeader != nil {
 		return common.Address{}
 	} else {
-		return h.ProposedHeader.Coinbase
+		addr, _ := crypto.PubKeyBytesToAddress(h.ProposedHeader.ProposerPubKey)
+		return addr
 	}
 }
 
@@ -311,6 +331,7 @@ func (h *Header) OfflineAddr() *common.Address {
 func (h *ProposedHeader) Hash() common.Hash {
 	return rlp.Hash(h)
 }
+
 func (h *EmptyBlockHeader) Hash() common.Hash {
 	return rlp.Hash(h)
 }
@@ -394,10 +415,27 @@ func (s Transactions) GetRlp(i int) []byte {
 	return enc
 }
 
-func (s *BlockCert) Len() int { return len(s.Votes) }
-
 func (s *BlockCert) Empty() bool {
-	return s == nil || s.Len() == 0
+	return s == nil || len(s.Signatures) == 0
+}
+
+func (s *FullBlockCert) Compress() *BlockCert {
+	if len(s.Votes) == 0 {
+		return &BlockCert{}
+	}
+	cert := &BlockCert{
+		Round:     s.Votes[0].Header.Round,
+		Step:      s.Votes[0].Header.Step,
+		VotedHash: s.Votes[0].Header.VotedHash,
+	}
+	for _, vote := range s.Votes {
+		cert.Signatures = append(cert.Signatures, &BlockCertSignature{
+			Signature:   vote.Signature,
+			Upgrade:     vote.Header.Upgrade,
+			TurnOffline: vote.Header.TurnOffline,
+		})
+	}
+	return cert
 }
 
 func (p NewEpochPayload) Bytes() []byte {
@@ -434,6 +472,17 @@ func (b Body) IsEmpty() bool {
 	return len(b.Transactions) == 0
 }
 
+func (p *BlockProposal) IsValid() bool {
+	if p.Block == nil || len(p.Signature) == 0 || p.Block.IsEmpty() {
+		return false
+	}
+	pubKey, err := crypto.Ecrecover(p.Block.Hash().Bytes(), p.Signature)
+	if err != nil {
+		return false
+	}
+	return bytes.Compare(pubKey, p.Block.Header.ProposedHeader.ProposerPubKey) == 0
+}
+
 type PublicFlipKey struct {
 	Key       []byte
 	Signature []byte
@@ -446,11 +495,6 @@ func (k PublicFlipKey) Hash() common.Hash {
 	return rlp.Hash(k)
 }
 
-type PrivateFlipKeysPackageCid struct {
-	Address common.Address
-	Cid     []byte
-}
-
 type PrivateFlipKeysPackage struct {
 	Data      []byte
 	Epoch     uint16
@@ -459,8 +503,12 @@ type PrivateFlipKeysPackage struct {
 	from atomic.Value
 }
 
-func (k PrivateFlipKeysPackage) Hash() common.Hash {
+func (k *PrivateFlipKeysPackage) Hash() common.Hash {
 	return rlp.Hash(k)
+}
+
+func (k *PrivateFlipKeysPackage) Hash128() common.Hash128 {
+	return rlp.Hash128(k)
 }
 
 type Answer byte
@@ -545,14 +593,36 @@ func (a *Answers) Answer(flipIndex uint) (answer Answer, wrongWords bool) {
 }
 
 type ValidationResult struct {
-	StrongFlips          int
-	WeakFlips            int
-	SuccessfulInviteAges []uint16
-	Validated            bool
-	Missed               bool
+	StrongFlipCids      [][]byte
+	WeakFlipCids        [][]byte
+	SuccessfulInvites   []*SuccessfulInvite
+	PayInvitationReward bool
+	Missed              bool
+	SavedInvites        uint8
+	NewIdentityState    uint8
+}
+
+type SuccessfulInvite struct {
+	Age    uint16
+	TxHash common.Hash
+}
+
+type AuthorResults struct {
+	HasOneReportedFlip     bool
+	HasOneNotQualifiedFlip bool
+	AllFlipsNotQualified   bool
 }
 
 type ValidationAuthors struct {
-	BadAuthors  map[common.Address]struct{}
-	GoodAuthors map[common.Address]*ValidationResult
+	BadAuthors    map[common.Address]BadAuthorReason
+	GoodAuthors   map[common.Address]*ValidationResult
+	AuthorResults map[common.Address]*AuthorResults
 }
+
+type BadAuthorReason = byte
+
+const (
+	NoQualifiedFlipsBadAuthor BadAuthorReason = 0
+	QualifiedByNoneBadAuthor  BadAuthorReason = 1
+	WrongWordsBadAuthor       BadAuthorReason = 2
+)

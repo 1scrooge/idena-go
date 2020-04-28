@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"github.com/idena-network/idena-go/blockchain"
 	"github.com/idena-network/idena-go/blockchain/fee"
@@ -10,6 +11,7 @@ import (
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/core/mempool"
 	"github.com/idena-network/idena-go/keystore"
+	"github.com/idena-network/idena-go/log"
 	"github.com/idena-network/idena-go/secstore"
 	"github.com/shopspring/decimal"
 	"math/big"
@@ -32,16 +34,19 @@ func NewBaseApi(engine *consensus.Engine, txpool *mempool.TxPool, ks *keystore.K
 }
 
 func (api *BaseApi) getAppState() *appstate.AppState {
-	return api.engine.GetAppState()
+	state, err := api.engine.ReadonlyAppState()
+	if err != nil {
+		panic(err)
+	}
+	return state
 }
 
 func (api *BaseApi) getCurrentCoinbase() common.Address {
 	return api.secStore.GetAddress()
 }
 
-func (api *BaseApi) getSignedTx(from common.Address, to *common.Address, txType types.TxType, amount decimal.Decimal,
-	maxFee decimal.Decimal, tips decimal.Decimal, nonce uint32, epoch uint16, payload []byte,
-	key *ecdsa.PrivateKey) (*types.Transaction, error) {
+func (api *BaseApi) getTx(from common.Address, to *common.Address, txType types.TxType, amount decimal.Decimal,
+	maxFee decimal.Decimal, tips decimal.Decimal, nonce uint32, epoch uint16, payload []byte) *types.Transaction {
 
 	// if maxFee is not set, we set it as 2x from fee
 	if maxFee == (decimal.Decimal{}) || maxFee == decimal.Zero {
@@ -52,10 +57,19 @@ func (api *BaseApi) getSignedTx(from common.Address, to *common.Address, txType 
 
 	tx := blockchain.BuildTx(api.getAppState(), from, to, txType, amount, maxFee, tips, nonce, epoch, payload)
 
+	return tx
+}
+
+func (api *BaseApi) getSignedTx(from common.Address, to *common.Address, txType types.TxType, amount decimal.Decimal,
+	maxFee decimal.Decimal, tips decimal.Decimal, nonce uint32, epoch uint16, payload []byte,
+	key *ecdsa.PrivateKey) (*types.Transaction, error) {
+
+	tx := api.getTx(from, to, txType, amount, maxFee, tips, nonce, epoch, payload)
+
 	return api.signTransaction(from, tx, key)
 }
 
-func (api *BaseApi) sendTx(from common.Address, to *common.Address, txType types.TxType, amount decimal.Decimal,
+func (api *BaseApi) sendTx(ctx context.Context, from common.Address, to *common.Address, txType types.TxType, amount decimal.Decimal,
 	maxFee decimal.Decimal, tips decimal.Decimal, nonce uint32, epoch uint16, payload []byte,
 	key *ecdsa.PrivateKey) (common.Hash, error) {
 
@@ -65,10 +79,12 @@ func (api *BaseApi) sendTx(from common.Address, to *common.Address, txType types
 		return common.Hash{}, err
 	}
 
-	return api.sendInternalTx(signedTx)
+	return api.sendInternalTx(ctx, signedTx)
 }
 
-func (api *BaseApi) sendInternalTx(tx *types.Transaction) (common.Hash, error) {
+func (api *BaseApi) sendInternalTx(ctx context.Context, tx *types.Transaction) (common.Hash, error) {
+	log.Info("Sending new tx", "ip", ctx.Value("remote"), "type", tx.Type, "hash", tx.Hash().Hex(), "nonce", tx.AccountNonce, "epoch", tx.Epoch)
+
 	if err := api.txpool.Add(tx); err != nil {
 		return common.Hash{}, err
 	}

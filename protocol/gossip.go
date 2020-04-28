@@ -7,6 +7,7 @@ import (
 	"github.com/idena-network/idena-go/blockchain"
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
+	"github.com/idena-network/idena-go/common/entry"
 	"github.com/idena-network/idena-go/common/eventbus"
 	"github.com/idena-network/idena-go/common/maputil"
 	"github.com/idena-network/idena-go/config"
@@ -16,6 +17,7 @@ import (
 	"github.com/idena-network/idena-go/events"
 	"github.com/idena-network/idena-go/log"
 	"github.com/idena-network/idena-go/pengings"
+	"github.com/idena-network/idena-go/rlp"
 	core "github.com/libp2p/go-libp2p-core"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -38,13 +40,14 @@ type IdenaGossipHandler struct {
 	cfg  config.P2P
 	bcn  *blockchain.Blockchain
 
-	peers        *peerSet
-	incomeBlocks chan *types.Block
-	proposals    *pengings.Proposals
-	votes        *pengings.Votes
+	peers           *peerSet
+	incomeBlocks    chan *types.Block
+	proposals       *pengings.Proposals
+	votes           *pengings.Votes
+	pushPullManager *PushPullManager
 
 	txpool              mempool.TransactionPool
-	flipKeyPool         *mempool.KeysPool
+	flipKeyPool         mempool.FlipKeysPool
 	flipper             *flip.Flipper
 	txChan              chan *events.NewTxEvent
 	flipKeyChan         chan *events.NewFlipKeyEvent
@@ -77,19 +80,26 @@ func NewIdenaGossipHandler(host core.Host, cfg config.P2P, chain *blockchain.Blo
 		incomeBatches:       &sync.Map{},
 		proposals:           proposals,
 		votes:               votes,
+		pushPullManager:     NewPushPullManager(),
 		txpool:              mempool.NewAsyncTxPool(txpool),
 		txChan:              make(chan *events.NewTxEvent, 100),
 		flipKeyChan:         make(chan *events.NewFlipKeyEvent, 200),
 		flipKeysPackageChan: make(chan *events.NewFlipKeysPackageEvent, 200),
 		flipper:             fp,
 		bus:                 bus,
-		flipKeyPool:         flipKeyPool,
+		flipKeyPool:         mempool.NewAsyncKeysPool(flipKeyPool),
 		appVersion:          appVersion,
 		log:                 log.New(),
 		pendingPeers:        make(map[peer.ID]struct{}),
 		metrics:             new(metricCollector),
 		connManager:         NewConnManager(host, cfg),
 	}
+	handler.pushPullManager.AddEntryHolder(pushVote, entry.NewDefaultHolder(3))
+	handler.pushPullManager.AddEntryHolder(pushBlock, entry.NewDefaultHolder(3))
+	handler.pushPullManager.AddEntryHolder(pushProof, entry.NewDefaultHolder(3))
+	handler.pushPullManager.AddEntryHolder(pushFlip, entry.NewDefaultHolder(1))
+	handler.pushPullManager.AddEntryHolder(pushKeyPackage, flipKeyPool)
+	handler.pushPullManager.AddEntryHolder(pushTx, entry.NewDefaultHolder(1))
 	handler.registerMetrics()
 	return handler
 }
@@ -98,6 +108,7 @@ func (h *IdenaGossipHandler) Start() {
 
 	setHandler := func() {
 		h.host.SetStreamHandler(IdenaProtocol, h.acceptStream)
+		h.connManager = NewConnManager(h.host, h.cfg)
 		notifiee := &notifiee{
 			connManager: h.connManager,
 		}
@@ -119,7 +130,7 @@ func (h *IdenaGossipHandler) Start() {
 	})
 	h.bus.Subscribe(events.NewFlipEventID, func(e eventbus.Event) {
 		newFlipEvent := e.(*events.NewFlipEvent)
-		h.broadcastFlipCid(newFlipEvent.FlipCid)
+		h.sendFlip(newFlipEvent.Flip)
 	})
 	h.bus.Subscribe(events.IpfsPortChangedEventId, func(e eventbus.Event) {
 		portChangedEvent := e.(*events.IpfsPortChangedEvent)
@@ -200,18 +211,21 @@ func (h *IdenaGossipHandler) handle(p *protoPeer) error {
 			h.proposeProof(query)
 		}
 	case ProposeBlock:
-		block := new(types.Block)
-		if err := msg.Decode(block); err != nil {
+		proposal := new(types.BlockProposal)
+		if err := msg.Decode(proposal); err != nil {
 			return errResp(DecodeErr, "%v: %v", msg, err)
 		}
-		if h.isProcessed(block) {
+		if h.isProcessed(proposal) {
 			return nil
 		}
-		p.markPayload(block)
+		p.markPayload(proposal)
+		if proposal.Block == nil || len(proposal.Signature) == 0 {
+			return nil
+		}
 		// if peer proposes this msg it should be on `query.Round-1` height
-		p.setHeight(block.Height() - 1)
-		if ok, _ := h.proposals.AddProposedBlock(block, p.id, time.Now().UTC()); ok {
-			h.ProposeBlock(block)
+		p.setHeight(proposal.Block.Height() - 1)
+		if ok, _ := h.proposals.AddProposedBlock(proposal, p.id, time.Now().UTC(), nil); ok {
+			h.ProposeBlock(proposal)
 		}
 	case Vote:
 		vote := new(types.Vote)
@@ -243,7 +257,7 @@ func (h *IdenaGossipHandler) handle(p *protoPeer) error {
 		}
 		block := h.bcn.GetBlock(query.Hash)
 		if block != nil {
-			p.sendMsg(ProposeBlock, block, false)
+			p.sendMsg(Block, block, false)
 		}
 	case GetBlocksRange:
 		var query getBlocksRangeRequest
@@ -272,6 +286,10 @@ func (h *IdenaGossipHandler) handle(p *protoPeer) error {
 		if err := msg.Decode(flipKey); err != nil {
 			return errResp(DecodeErr, "%v: %v", msg, err)
 		}
+		if h.isProcessed(flipKey) {
+			return nil
+		}
+		p.markPayload(flipKey)
 		h.flipKeyPool.AddPublicFlipKey(flipKey, false)
 	case SnapshotManifest:
 		manifest := new(snapshot.Manifest)
@@ -279,26 +297,6 @@ func (h *IdenaGossipHandler) handle(p *protoPeer) error {
 			return errResp(DecodeErr, "%v: %v", msg, err)
 		}
 		p.manifest = manifest
-	case PushFlipCid:
-		cid := new(flipCid)
-		if err := msg.Decode(cid); err != nil {
-			return errResp(DecodeErr, "%v: %v", msg, err)
-		}
-		if h.isProcessed(cid) {
-			return nil
-		}
-		p.markPayload(cid)
-		if !h.flipper.Has(cid.Cid) {
-			p.sendMsg(PullFlip, cid, false)
-		}
-	case PullFlip:
-		cid := new(flipCid)
-		if err := msg.Decode(cid); err != nil {
-			return errResp(DecodeErr, "%v: %v", msg, err)
-		}
-		if f, err := h.flipper.ReadFlip(cid.Cid); err == nil {
-			p.sendMsg(FlipBody, f, false)
-		}
 	case FlipKeysPackage:
 		keysPackage := new(types.PrivateFlipKeysPackage)
 		if err := msg.Decode(keysPackage); err != nil {
@@ -309,16 +307,39 @@ func (h *IdenaGossipHandler) handle(p *protoPeer) error {
 		}
 		p.markPayload(keysPackage)
 		h.flipKeyPool.AddPrivateKeysPackage(keysPackage, false)
-	case FlipKeysPackageCid:
-		packageCid := new(types.PrivateFlipKeysPackageCid)
-		if err := msg.Decode(packageCid); err != nil {
+	case Push:
+		pushHash := new(pushPullHash)
+		if err := msg.Decode(pushHash); err != nil {
 			return errResp(DecodeErr, "%v: %v", msg, err)
 		}
-		if h.isProcessed(packageCid) {
+
+		if pushHash.Invalid() {
 			return nil
 		}
-		p.markPayload(packageCid)
-		h.flipKeyPool.AddPrivateKeysPackageCid(packageCid)
+
+		p.markPayload(pushHash)
+		h.pushPullManager.addPush(p.id, *pushHash)
+	case Pull:
+		var pullHash pushPullHash
+		if err := msg.Decode(&pullHash); err != nil {
+			return errResp(DecodeErr, "%v: %v", msg, err)
+		}
+		if pullHash.Invalid() {
+			return nil
+		}
+		if entry, ok := h.pushPullManager.GetEntry(pullHash); ok {
+			h.sendEntry(p, pullHash, entry)
+		}
+	case Block:
+		block := new(types.Block)
+		if err := msg.Decode(block); err != nil {
+			return errResp(DecodeErr, "%v: %v", msg, err)
+		}
+		if h.isProcessed(block) {
+			return nil
+		}
+		p.markPayload(block)
+		h.proposals.AddBlock(block)
 	}
 
 	return nil
@@ -366,10 +387,9 @@ func (h *IdenaGossipHandler) runPeer(stream network.Stream, inbound bool) (*prot
 	go h.runListening(peer)
 	go peer.broadcast()
 
-	if peer.shouldSyncMempool() {
-		go h.syncTxPool(peer)
-		go h.syncFlipKeyPool(peer)
-	}
+	go h.syncTxPool(peer)
+	go h.syncFlipKeyPool(peer)
+
 	h.sendManifest(peer)
 
 	h.log.Info("Peer connected", "id", peer.id.Pretty(), "inbound", inbound)
@@ -504,6 +524,8 @@ func (h *IdenaGossipHandler) broadcastLoop() {
 			h.broadcastFlipKey(key.Key, key.Own)
 		case key := <-h.flipKeysPackageChan:
 			h.broadcastFlipKeysPackage(key.Key, key.Own)
+		case pullReq := <-h.pushPullManager.Requests():
+			h.sendPull(pullReq.peer, pullReq.hash)
 		}
 	}
 }
@@ -599,14 +621,51 @@ func (h *IdenaGossipHandler) ProposeProof(round uint64, hash common.Hash, proof 
 }
 
 func (h *IdenaGossipHandler) proposeProof(payload *proposeProof) {
-	h.peers.SendWithFilter(ProposeProof, payload, false)
+	hash := pushPullHash{
+		Type: pushProof,
+		Hash: rlp.Hash128(payload),
+	}
+	h.pushPullManager.AddEntry(hash, payload)
+	h.sendPush(hash)
 }
 
-func (h *IdenaGossipHandler) ProposeBlock(block *types.Block) {
-	h.peers.SendWithFilter(ProposeBlock, block, false)
+func (h *IdenaGossipHandler) ProposeBlock(block *types.BlockProposal) {
+	hash := pushPullHash{
+		Type: pushBlock,
+		Hash: rlp.Hash128(block),
+	}
+	h.pushPullManager.AddEntry(hash, block)
+	h.sendPush(hash)
 }
 func (h *IdenaGossipHandler) SendVote(vote *types.Vote) {
-	h.peers.SendWithFilter(Vote, vote, false)
+	hash := pushPullHash{
+		Type: pushVote,
+		Hash: rlp.Hash128(vote),
+	}
+	h.pushPullManager.AddEntry(hash, vote)
+	h.sendPush(hash)
+}
+
+func (h *IdenaGossipHandler) sendPush(hash pushPullHash) {
+	h.peers.SendWithFilter(Push, hash, false)
+}
+
+func (h *IdenaGossipHandler) sendEntry(p *protoPeer, hash pushPullHash, entry interface{}) {
+	switch hash.Type {
+	case pushVote:
+		p.sendMsg(Vote, entry, false)
+	case pushBlock:
+		p.sendMsg(ProposeBlock, entry, false)
+	case pushProof:
+		p.sendMsg(ProposeProof, entry, false)
+	case pushFlip:
+		p.sendMsg(FlipBody, entry, false)
+	case pushKeyPackage:
+		p.sendMsg(FlipKeysPackage, entry, false)
+	case pushTx:
+		p.sendMsg(NewTx, entry, false)
+	default:
+	}
 }
 
 func errResp(code int, format string, v ...interface{}) error {
@@ -614,18 +673,41 @@ func errResp(code int, format string, v ...interface{}) error {
 }
 
 func (h *IdenaGossipHandler) broadcastTx(tx *types.Transaction, own bool) {
-	h.peers.SendWithFilter(NewTx, tx, own)
+
+	hash := pushPullHash{
+		Type: pushTx,
+		Hash: rlp.Hash128(tx),
+	}
+	h.pushPullManager.AddEntry(hash, tx)
+	h.peers.SendWithFilter(Push, hash, own)
 }
 
-func (h *IdenaGossipHandler) broadcastFlipCid(cid []byte) {
-	h.peers.SendWithFilter(PushFlipCid, &flipCid{cid}, false)
+func (h *IdenaGossipHandler) sendFlip(flip *types.Flip) {
+
+	hash := pushPullHash{
+		Type: pushFlip,
+		Hash: rlp.Hash128(flip),
+	}
+	h.pushPullManager.AddEntry(hash, flip)
+	h.sendPush(hash)
 }
 
 func (h *IdenaGossipHandler) broadcastFlipKey(flipKey *types.PublicFlipKey, own bool) {
 	h.peers.SendWithFilter(FlipKey, flipKey, own)
 }
 func (h *IdenaGossipHandler) broadcastFlipKeysPackage(flipKeysPackage *types.PrivateFlipKeysPackage, own bool) {
-	h.peers.SendWithFilter(FlipKeysPackage, flipKeysPackage, own)
+	hash := pushPullHash{
+		Type: pushKeyPackage,
+		Hash: rlp.Hash128(flipKeysPackage),
+	}
+	h.sendPush(hash)
+}
+
+func (h *IdenaGossipHandler) sendPull(peerId peer.ID, hash pushPullHash) {
+	peer := h.peers.Peer(peerId)
+	if peer != nil {
+		peer.sendMsg(Pull, hash, false)
+	}
 }
 
 func (h *IdenaGossipHandler) RequestBlockByHash(hash common.Hash) {
@@ -637,8 +719,13 @@ func (h *IdenaGossipHandler) RequestBlockByHash(hash common.Hash) {
 func (h *IdenaGossipHandler) syncTxPool(p *protoPeer) {
 	pending := h.txpool.GetPendingTransaction()
 	for _, tx := range pending {
-		p.sendMsg(NewTx, tx, false)
-		p.markPayload(tx)
+		payload := pushPullHash{
+			Type: pushTx,
+			Hash: rlp.Hash128(tx),
+		}
+		h.pushPullManager.AddEntry(payload, tx)
+		p.sendMsg(Push, payload, false)
+		p.markPayload(payload)
 	}
 }
 
@@ -656,9 +743,14 @@ func (h *IdenaGossipHandler) syncFlipKeyPool(p *protoPeer) {
 		p.sendMsg(FlipKey, key, false)
 	}
 
-	keysPackages := h.flipKeyPool.GetFlipPackagesCids()
-	for _, flipPackageCid := range keysPackages {
-		p.sendMsg(FlipKeysPackageCid, flipPackageCid, false)
+	keysPackages := h.flipKeyPool.GetFlipPackagesHashes()
+	for _, hash := range keysPackages {
+		payload := pushPullHash{
+			Type: pushKeyPackage,
+			Hash: hash,
+		}
+		p.sendMsg(Push, payload, false)
+		p.markPayload(payload)
 	}
 }
 func (h *IdenaGossipHandler) PotentialForwardPeers(round uint64) []peer.ID {
@@ -701,16 +793,24 @@ func (h *IdenaGossipHandler) Endpoint() string {
 	return h.host.ID().Pretty()
 }
 
-func (h *IdenaGossipHandler) AddPeer(peerId peer.ID, addr string) error {
-	ma, err := multiaddr.NewMultiaddr(addr)
+func (h *IdenaGossipHandler) AddPeer(url string) error {
+	ma, err := multiaddr.NewMultiaddr(url)
+
 	if err != nil {
 		return err
 	}
+
+	transportAddr, peerId := peer.SplitAddr(ma)
+
+	if transportAddr == nil || peerId == "" {
+		return errors.New("invalid url")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 
 	err = h.host.Connect(ctx, peer.AddrInfo{
 		ID:    peerId,
-		Addrs: []multiaddr.Multiaddr{ma},
+		Addrs: []multiaddr.Multiaddr{transportAddr},
 	})
 	cancel()
 	return err
@@ -718,4 +818,8 @@ func (h *IdenaGossipHandler) AddPeer(peerId peer.ID, addr string) error {
 
 func (h *IdenaGossipHandler) WrongTime() bool {
 	return h.wrongTime
+}
+
+func (h *IdenaGossipHandler) IsConnected(id peer.ID) bool {
+	return h.peers.Peer(id) != nil
 }

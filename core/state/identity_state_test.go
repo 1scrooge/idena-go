@@ -82,6 +82,7 @@ func TestIdentityStateDB_CreatePreliminaryCopy(t *testing.T) {
 	preliminary.DropPreliminary()
 
 	it, _ := preliminary.db.Iterator(nil, nil)
+	defer it.Close()
 	require.False(t, it.Valid())
 
 	require.True(t, stateDb.HasVersion(100))
@@ -121,8 +122,10 @@ func TestIdentityStateDB_SwitchToPreliminary(t *testing.T) {
 
 	prevVreliminaryPrefix := loadIdentityPrefix(preliminary.original, true)
 
-	stateDb.SwitchToPreliminary(150)
-
+	batch, dropDb, err := stateDb.SwitchToPreliminary(150)
+	require.NoError(t, err)
+	batch.WriteSync()
+	common.ClearDb(dropDb)
 	preliminaryPrefix := loadIdentityPrefix(preliminary.original, true)
 	prefix := loadIdentityPrefix(stateDb.original, false)
 
@@ -131,6 +134,7 @@ func TestIdentityStateDB_SwitchToPreliminary(t *testing.T) {
 	require.Equal(t, prevVreliminaryPrefix, prefix)
 
 	it, _ := database.Iterator(nil, nil)
+	defer it.Close()
 	require.False(t, it.Valid())
 
 	require.Equal(t, root, stateDb.Root())

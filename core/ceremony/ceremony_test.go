@@ -6,11 +6,16 @@ import (
 	"github.com/idena-network/idena-go/blockchain"
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
+	"github.com/idena-network/idena-go/common/eventbus"
 	"github.com/idena-network/idena-go/config"
+	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/core/state"
 	"github.com/idena-network/idena-go/crypto"
 	"github.com/idena-network/idena-go/rlp"
+	"github.com/idena-network/idena-go/stats/collector"
 	"github.com/stretchr/testify/require"
+	dbm "github.com/tendermint/tm-db"
+	"math/big"
 	"testing"
 )
 
@@ -115,6 +120,11 @@ func Test_determineNewIdentityState(t *testing.T) {
 		{
 			state.Newbie,
 			MinShortScore, MinLongScore, MinTotalScore, 11, false,
+			state.Newbie, false, false,
+		},
+		{
+			state.Newbie,
+			MinShortScore, MinLongScore, MinTotalScore, 13, false,
 			state.Verified, false, false,
 		},
 		{
@@ -194,7 +204,7 @@ func Test_determineNewIdentityState(t *testing.T) {
 		},
 		{
 			state.Newbie,
-			MinShortScore, 0, 0.1, 11, false,
+			MinShortScore, 0, 0.1, 13, false,
 			state.Killed, false, true,
 		},
 		{
@@ -232,12 +242,67 @@ func Test_determineNewIdentityState(t *testing.T) {
 			MinShortScore, 0, 0.1, 10, false,
 			state.Killed, false, true,
 		},
+		{
+			state.Suspended,
+			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			state.Human, false, false,
+		},
+		{
+			state.Suspended,
+			MinShortScore, MinLongScore, MinHumanTotalScore, 23, false,
+			state.Verified, false, false,
+		},
+		{
+			state.Zombie,
+			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			state.Human, false, false,
+		},
+		{
+			state.Zombie,
+			MinShortScore, MinLongScore, MinHumanTotalScore, 23, false,
+			state.Verified, false, false,
+		},
+		{
+			state.Human,
+			0.1, MinLongScore, MinHumanTotalScore, 24, false,
+			state.Suspended, false, false,
+		},
+		{
+			state.Human,
+			MinShortScore, 0.1, MinHumanTotalScore, 24, false,
+			state.Killed, false, false,
+		},
+		{
+			state.Human,
+			0.1, 0.1, MinHumanTotalScore, 24, false,
+			state.Suspended, false, true,
+		},
+		{
+			state.Human,
+			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			state.Human, false, true,
+		},
+		{
+			state.Human,
+			MinShortScore, MinLongScore, MinHumanTotalScore, 24, true,
+			state.Suspended, false, false,
+		},
+		{
+			state.Human,
+			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			state.Human, true, true,
+		},
+		{
+			state.Verified,
+			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			state.Human, false, false,
+		},
 	}
 
 	require := require.New(t)
 
-	for _, c := range cases {
-		require.Equal(c.expected, determineNewIdentityState(state.Identity{State: c.prev}, c.shortScore, c.longScore, c.totalScore, c.totalQualifiedFlips, c.missed, c.noQualShort, c.noQualLong))
+	for i, c := range cases {
+		require.Equal(c.expected, determineNewIdentityState(state.Identity{State: c.prev}, c.shortScore, c.longScore, c.totalScore, c.totalQualifiedFlips, c.missed, c.noQualShort, c.noQualLong), "index = %v", i)
 	}
 }
 
@@ -307,7 +372,7 @@ func Test_flipPos(t *testing.T) {
 	r.Equal(2, flipPos(flips, []byte{2, 3, 4}))
 }
 
-func Test_analizeAuthors(t *testing.T) {
+func Test_analyzeAuthors(t *testing.T) {
 	vc := ValidationCeremony{}
 
 	auth1 := common.Address{1}
@@ -315,8 +380,9 @@ func Test_analizeAuthors(t *testing.T) {
 	auth3 := common.Address{3}
 	auth4 := common.Address{4}
 	auth5 := common.Address{5}
+	auth6 := common.Address{6}
 
-	vc.flips = [][]byte{{0x0}, {0x1}, {0x2}, {0x3}, {0x4}, {0x5}, {0x6}, {0x7}, {0x8}, {0x9}}
+	vc.flips = [][]byte{{0x0}, {0x1}, {0x2}, {0x3}, {0x4}, {0x5}, {0x6}, {0x7}, {0x8}, {0x9}, {0xa}, {0xb}, {0xc}}
 	vc.flipAuthorMap = map[common.Hash]common.Address{
 		rlp.Hash([]byte{0x0}): auth1,
 		rlp.Hash([]byte{0x1}): auth1,
@@ -332,6 +398,10 @@ func Test_analizeAuthors(t *testing.T) {
 		rlp.Hash([]byte{0x8}): auth4,
 
 		rlp.Hash([]byte{0x9}): auth5,
+
+		rlp.Hash([]byte{0xa}): auth6,
+		rlp.Hash([]byte{0xb}): auth6,
+		rlp.Hash([]byte{0xc}): auth6,
 	}
 
 	qualification := []FlipQualification{
@@ -349,19 +419,40 @@ func Test_analizeAuthors(t *testing.T) {
 		{status: NotQualified},
 
 		{status: QualifiedByNone},
+
+		{status: Qualified},
+		{status: WeaklyQualified},
+		{status: Qualified},
 	}
 
-	bad, good := vc.analizeAuthors(qualification)
+	bad, good, authorResults := vc.analyzeAuthors(qualification)
 
 	require.Contains(t, bad, auth2)
 	require.Contains(t, bad, auth3)
 	require.Contains(t, bad, auth4)
 	require.Contains(t, bad, auth5)
 	require.NotContains(t, bad, auth1)
+	require.NotContains(t, bad, auth6)
 
 	require.Contains(t, good, auth1)
-	require.Equal(t, 1, good[auth1].WeakFlips)
-	require.Equal(t, 1, good[auth1].StrongFlips)
+	require.Equal(t, 1, len(good[auth1].WeakFlipCids))
+	require.Equal(t, 1, len(good[auth1].StrongFlipCids))
+
+	require.True(t, authorResults[auth1].HasOneNotQualifiedFlip)
+	require.False(t, authorResults[auth1].AllFlipsNotQualified)
+	require.False(t, authorResults[auth1].HasOneReportedFlip)
+
+	require.False(t, authorResults[auth6].HasOneNotQualifiedFlip)
+	require.False(t, authorResults[auth6].AllFlipsNotQualified)
+	require.False(t, authorResults[auth6].HasOneReportedFlip)
+
+	require.False(t, authorResults[auth3].HasOneNotQualifiedFlip)
+	require.False(t, authorResults[auth3].AllFlipsNotQualified)
+	require.True(t, authorResults[auth3].HasOneReportedFlip)
+
+	require.True(t, authorResults[auth4].HasOneNotQualifiedFlip)
+	require.True(t, authorResults[auth4].AllFlipsNotQualified)
+	require.False(t, authorResults[auth4].HasOneReportedFlip)
 }
 
 func Test_incSuccessfulInvites(t *testing.T) {
@@ -371,9 +462,9 @@ func Test_incSuccessfulInvites(t *testing.T) {
 	badAuth := common.Address{0x3}
 
 	authors := &types.ValidationAuthors{
-		BadAuthors: map[common.Address]struct{}{badAuth: {}},
+		BadAuthors: map[common.Address]types.BadAuthorReason{badAuth: types.WrongWordsBadAuthor},
 		GoodAuthors: map[common.Address]*types.ValidationResult{
-			auth1: {StrongFlips: 1, WeakFlips: 1},
+			auth1: {StrongFlipCids: [][]byte{{0x1}}, WeakFlipCids: [][]byte{{0x1}}},
 		},
 	}
 
@@ -445,12 +536,16 @@ func Test_incSuccessfulInvites(t *testing.T) {
 		},
 	}, 3, state.Verified, epoch)
 
-	require.Equal(t, len(authors.GoodAuthors[auth1].SuccessfulInviteAges), 4)
-	require.Equal(t, []uint16{1, 3, 2, 3}, authors.GoodAuthors[auth1].SuccessfulInviteAges)
+	require.Equal(t, len(authors.GoodAuthors[auth1].SuccessfulInvites), 4)
+	var ages []uint16
+	for _, si := range authors.GoodAuthors[auth1].SuccessfulInvites {
+		ages = append(ages, si.Age)
+	}
+	require.Equal(t, []uint16{1, 3, 2, 3}, ages)
 
-	require.Equal(t, len(authors.GoodAuthors[god].SuccessfulInviteAges), 1)
-	require.Equal(t, []uint16{1}, authors.GoodAuthors[god].SuccessfulInviteAges)
-	require.True(t, authors.GoodAuthors[god].Validated)
+	require.Equal(t, len(authors.GoodAuthors[god].SuccessfulInvites), 1)
+	require.Equal(t, uint16(1), authors.GoodAuthors[god].SuccessfulInvites[0].Age)
+	require.True(t, authors.GoodAuthors[god].PayInvitationReward)
 	require.False(t, authors.GoodAuthors[god].Missed)
 
 	require.NotContains(t, authors.GoodAuthors, badAuth)
@@ -461,4 +556,31 @@ func Test_determineIdentityBirthday(t *testing.T) {
 	identity.Birthday = 1
 	identity.State = state.Newbie
 	require.Equal(t, uint16(1), determineIdentityBirthday(2, identity, state.Newbie))
+}
+
+func Test_applyOnState(t *testing.T) {
+	db := dbm.NewMemDB()
+	appstate := appstate.NewAppState(db, eventbus.New())
+
+	addr1 := common.Address{0x1}
+
+	appstate.State.SetState(addr1, state.Newbie)
+	appstate.State.AddStake(addr1, big.NewInt(100))
+	appstate.State.AddBalance(addr1, big.NewInt(10))
+
+	identities := applyOnState(appstate, collector.NewStatsCollector(), addr1, cacheValue{
+		prevState:                state.Newbie,
+		birthday:                 3,
+		shortFlipPoint:           1,
+		shortQualifiedFlipsCount: 2,
+		state:                    state.Verified,
+	})
+	identity := appstate.State.GetIdentity(addr1)
+	require.Equal(t, 1, identities)
+	require.Equal(t, state.Verified, identity.State)
+	require.Equal(t, uint16(3), identity.Birthday)
+	require.Equal(t, float32(1), identity.GetShortFlipPoints())
+	require.Equal(t, uint32(2), identity.QualifiedFlips)
+	require.True(t, appstate.State.GetBalance(addr1).Cmp(big.NewInt(85)) == 0)
+	require.True(t, appstate.State.GetStakeBalance(addr1).Cmp(big.NewInt(25)) == 0)
 }

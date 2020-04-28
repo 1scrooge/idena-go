@@ -14,7 +14,6 @@ import (
 	"github.com/idena-network/idena-go/events"
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/log"
-	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/pkg/errors"
 	"os"
 	"time"
@@ -72,7 +71,7 @@ func (fs *fastSync) createPreliminaryCopy(height uint64) (*state.IdentityStateDB
 }
 
 func (fs *fastSync) dropPreliminaries() {
-	fs.chain.RemovePreliminaryHead()
+	fs.chain.RemovePreliminaryHead(nil)
 	fs.appState.IdentityState.DropPreliminary()
 	fs.stateDb = nil
 }
@@ -86,6 +85,9 @@ func (fs *fastSync) preConsuming(head *types.Header) (from uint64, err error) {
 	if fs.chain.PreliminaryHead == nil {
 		fs.chain.PreliminaryHead = head
 		fs.stateDb, err = fs.createPreliminaryCopy(head.Height())
+		if err != nil {
+			return 0, err
+		}
 		from = head.Height() + 1
 		fs.loadValidators()
 		return from, err
@@ -140,14 +142,14 @@ func (fs *fastSync) applyDeferredBlocks() (uint64, error) {
 				return b.Header.Height(), err
 			}
 			fs.chain.WriteTxIndex(b.Header.Hash(), txs)
-			fs.chain.SaveTxs(b.Header, txs)
+			fs.chain.Indexer().HandleBlockTransactions(b.Header, txs)
 		}
 	}
 	return 0, nil
 }
 
 func (fs *fastSync) GetBlockTransactions(hash common.Hash, ipfsHash []byte) (types.Transactions, error) {
-	if txs, err := fs.ipfs.Get(ipfsHash); err != nil {
+	if txs, err := fs.ipfs.Get(ipfsHash, ipfs.Block); err != nil {
 		return nil, err
 	} else {
 		if len(txs) > 0 {
@@ -168,7 +170,7 @@ func (fs *fastSync) processBatch(batch *batch, attemptNum int) error {
 		return errors.New("number of attempts exceeded limit")
 	}
 	reload := func(from uint64) error {
-		b := fs.requestBatch(from, batch.to, batch.p.id)
+		b := requestBatch(fs.pm, from, batch.to, batch.p.id)
 		if b == nil {
 			return errors.New(fmt.Sprintf("batch (%v-%v) can't be loaded", from, batch.to))
 		}
@@ -198,7 +200,7 @@ func (fs *fastSync) processBatch(batch *batch, attemptNum int) error {
 			}
 
 			fs.deferredHeaders = append(fs.deferredHeaders, blockPeer{*block, batch.p.id})
-			if block.Cert != nil && block.Cert.Len() > 0 {
+			if block.Cert != nil && !block.Cert.Empty() {
 				if from, err := fs.applyDeferredBlocks(); err != nil {
 					return reload(from)
 				}
@@ -247,23 +249,6 @@ func (fs *fastSync) validateHeader(block *block) error {
 	return nil
 }
 
-func (fs *fastSync) requestBatch(from, to uint64, ignoredPeer peer.ID) *batch {
-	knownHeights := fs.pm.GetKnownHeights()
-	if knownHeights == nil {
-		return nil
-	}
-	for peerId, height := range knownHeights {
-		if (peerId != ignoredPeer || len(knownHeights) == 1) && height >= to {
-			if batch, err := fs.pm.GetBlocksRange(peerId, from, to); err != nil {
-				continue
-			} else {
-				return batch
-			}
-		}
-	}
-	return nil
-}
-
 func (fs *fastSync) postConsuming() error {
 	if fs.chain.PreliminaryHead.Height() != fs.manifest.Height {
 		return errors.New("preliminary head is lower than manifest's head")
@@ -292,18 +277,12 @@ func (fs *fastSync) postConsuming() error {
 		//TODO : add snapshot to ban list
 		return err
 	}
-
 	fs.stateDb.SaveForcedVersion(fs.chain.PreliminaryHead.Height())
 
-	err = fs.appState.IdentityState.SwitchToPreliminary(fs.manifest.Height)
-	if err != nil {
-		fs.appState.State.DropSnapshot(fs.manifest)
+	if err := fs.chain.AtomicSwitchToPreliminary(fs.manifest); err != nil {
 		return err
 	}
-	fs.appState.State.CommitSnapshot(fs.manifest)
-	fs.appState.ValidatorsCache.Load()
-	fs.chain.SwitchToPreliminary()
-	fs.chain.RemovePreliminaryHead()
+
 	fs.bus.Publish(events.FastSyncCompletedEvent{})
 	return nil
 }

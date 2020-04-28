@@ -21,7 +21,6 @@ var (
 	EvidencePrefix        = []byte("evi")
 	LotterySeedKey        = []byte("ls")
 	FlipCidPrefix         = []byte("cid")
-	KeysPackagePrefix     = []byte("kp")
 )
 
 type EpochDb struct {
@@ -233,6 +232,10 @@ func (edb *EpochDb) HasFlipCid(cid []byte) bool {
 	return has
 }
 
+func (edb *EpochDb) DeleteFlipCid(cid []byte) {
+	edb.db.Delete(append(FlipCidPrefix, cid...))
+}
+
 func (edb *EpochDb) IterateOverFlipCids(callback func(cid []byte)) {
 	it, err := edb.db.Iterator(append(FlipCidPrefix, ipfs.MinCid[:]...), append(FlipCidPrefix, ipfs.MaxCid[:]...))
 	assertNoError(err)
@@ -254,17 +257,4 @@ func (edb *EpochDb) HasAnswerHash(addr common.Address) bool {
 	has, err := edb.db.Has(key)
 	assertNoError(err)
 	return has
-}
-
-func (edb *EpochDb) WriteKeysPackageCid(cid []byte) {
-	assertNoError(edb.db.Set(append(KeysPackagePrefix, cid...), []byte{}))
-}
-
-func (edb *EpochDb) IterateOverKeysPackageCids(callback func(cid []byte)) {
-	it, err := edb.db.Iterator(append(KeysPackagePrefix, ipfs.MinCid[:]...), append(KeysPackagePrefix, ipfs.MaxCid[:]...))
-	assertNoError(err)
-	defer it.Close()
-	for ; it.Valid(); it.Next() {
-		callback(it.Key()[len(KeysPackagePrefix):])
-	}
 }

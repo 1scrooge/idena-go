@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/common/hexutil"
+	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/core/ceremony"
 	"github.com/idena-network/idena-go/core/profile"
 	"github.com/idena-network/idena-go/core/state"
@@ -55,7 +57,7 @@ type Balance struct {
 }
 
 func (api *DnaApi) GetBalance(address common.Address) Balance {
-	state := api.baseApi.engine.GetAppState()
+	state := api.baseApi.getAppState()
 
 	return Balance{
 		Stake:   blockchain.ConvertToFloat(state.State.GetStakeBalance(address)),
@@ -72,6 +74,7 @@ type SendTxArgs struct {
 	Amount  decimal.Decimal `json:"amount"`
 	MaxFee  decimal.Decimal `json:"maxFee"`
 	Payload *hexutil.Bytes  `json:"payload"`
+	Tips    decimal.Decimal `json:"tips"`
 	BaseTxArgs
 }
 
@@ -94,7 +97,7 @@ type Invite struct {
 	Key      string         `json:"key"`
 }
 
-func (api *DnaApi) SendInvite(args SendInviteArgs) (Invite, error) {
+func (api *DnaApi) SendInvite(ctx context.Context, args SendInviteArgs) (Invite, error) {
 	receiver := args.To
 	var key *ecdsa.PrivateKey
 
@@ -103,7 +106,7 @@ func (api *DnaApi) SendInvite(args SendInviteArgs) (Invite, error) {
 		receiver = crypto.PubkeyToAddress(key.PublicKey)
 	}
 
-	hash, err := api.baseApi.sendTx(api.baseApi.getCurrentCoinbase(), &receiver, types.InviteTx, args.Amount, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, nil, nil)
+	hash, err := api.baseApi.sendTx(ctx, api.baseApi.getCurrentCoinbase(), &receiver, types.InviteTx, args.Amount, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, nil, nil)
 
 	if err != nil {
 		return Invite{}, err
@@ -121,7 +124,7 @@ func (api *DnaApi) SendInvite(args SendInviteArgs) (Invite, error) {
 	}, nil
 }
 
-func (api *DnaApi) ActivateInvite(args ActivateInviteArgs) (common.Hash, error) {
+func (api *DnaApi) ActivateInvite(ctx context.Context, args ActivateInviteArgs) (common.Hash, error) {
 	var key *ecdsa.PrivateKey
 	from := api.baseApi.getCurrentCoinbase()
 	if len(args.Key) > 0 {
@@ -142,7 +145,7 @@ func (api *DnaApi) ActivateInvite(args ActivateInviteArgs) (common.Hash, error) 
 		coinbase := api.baseApi.getCurrentCoinbase()
 		to = &coinbase
 	}
-	hash, err := api.baseApi.sendTx(from, to, types.ActivationTx, decimal.Zero, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, payload, key)
+	hash, err := api.baseApi.sendTx(ctx, from, to, types.ActivationTx, decimal.Zero, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, payload, key)
 
 	if err != nil {
 		return common.Hash{}, err
@@ -151,9 +154,9 @@ func (api *DnaApi) ActivateInvite(args ActivateInviteArgs) (common.Hash, error) 
 	return hash, nil
 }
 
-func (api *DnaApi) BecomeOnline(args BaseTxArgs) (common.Hash, error) {
+func (api *DnaApi) BecomeOnline(ctx context.Context, args BaseTxArgs) (common.Hash, error) {
 	from := api.baseApi.getCurrentCoinbase()
-	hash, err := api.baseApi.sendTx(from, nil, types.OnlineStatusTx, decimal.Zero, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, attachments.CreateOnlineStatusAttachment(true), nil)
+	hash, err := api.baseApi.sendTx(ctx, from, nil, types.OnlineStatusTx, decimal.Zero, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, attachments.CreateOnlineStatusAttachment(true), nil)
 
 	if err != nil {
 		return common.Hash{}, err
@@ -162,9 +165,9 @@ func (api *DnaApi) BecomeOnline(args BaseTxArgs) (common.Hash, error) {
 	return hash, nil
 }
 
-func (api *DnaApi) BecomeOffline(args BaseTxArgs) (common.Hash, error) {
+func (api *DnaApi) BecomeOffline(ctx context.Context, args BaseTxArgs) (common.Hash, error) {
 	from := api.baseApi.getCurrentCoinbase()
-	hash, err := api.baseApi.sendTx(from, nil, types.OnlineStatusTx, decimal.Zero, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, attachments.CreateOnlineStatusAttachment(false), nil)
+	hash, err := api.baseApi.sendTx(ctx, from, nil, types.OnlineStatusTx, decimal.Zero, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, attachments.CreateOnlineStatusAttachment(false), nil)
 
 	if err != nil {
 		return common.Hash{}, err
@@ -173,14 +176,14 @@ func (api *DnaApi) BecomeOffline(args BaseTxArgs) (common.Hash, error) {
 	return hash, nil
 }
 
-func (api *DnaApi) SendTransaction(args SendTxArgs) (common.Hash, error) {
+func (api *DnaApi) SendTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) {
 
 	var payload []byte
 	if args.Payload != nil {
 		payload = *args.Payload
 	}
 
-	return api.baseApi.sendTx(args.From, args.To, args.Type, args.Amount, args.MaxFee, decimal.Zero, args.Nonce, args.Epoch, payload, nil)
+	return api.baseApi.sendTx(ctx, args.From, args.To, args.Type, args.Amount, args.MaxFee, args.Tips, args.Nonce, args.Epoch, payload, nil)
 }
 
 type FlipWords struct {
@@ -190,30 +193,32 @@ type FlipWords struct {
 }
 
 type Identity struct {
-	Address          common.Address  `json:"address"`
-	ProfileHash      string          `json:"profileHash"`
-	Stake            decimal.Decimal `json:"stake"`
-	Invites          uint8           `json:"invites"`
-	Age              uint16          `json:"age"`
-	State            string          `json:"state"`
-	PubKey           string          `json:"pubkey"`
-	RequiredFlips    uint8           `json:"requiredFlips"`
-	FlipKeyWordPairs []FlipWords     `json:"flipKeyWordPairs"`
-	MadeFlips        uint8           `json:"madeFlips"`
-	QualifiedFlips   uint32          `json:"totalQualifiedFlips"`
-	ShortFlipPoints  float32         `json:"totalShortFlipPoints"`
-	Flips            []string        `json:"flips"`
-	Online           bool            `json:"online"`
-	Generation       uint32          `json:"generation"`
-	Code             hexutil.Bytes   `json:"code"`
-	Invitees         []state.TxAddr  `json:"invitees"`
-	Penalty          decimal.Decimal `json:"penalty"`
+	Address             common.Address  `json:"address"`
+	ProfileHash         string          `json:"profileHash"`
+	Stake               decimal.Decimal `json:"stake"`
+	Invites             uint8           `json:"invites"`
+	Age                 uint16          `json:"age"`
+	State               string          `json:"state"`
+	PubKey              string          `json:"pubkey"`
+	RequiredFlips       uint8           `json:"requiredFlips"`
+	AvailableFlips      uint8           `json:"availableFlips"`
+	FlipKeyWordPairs    []FlipWords     `json:"flipKeyWordPairs"`
+	MadeFlips           uint8           `json:"madeFlips"`
+	QualifiedFlips      uint32          `json:"totalQualifiedFlips"`
+	ShortFlipPoints     float32         `json:"totalShortFlipPoints"`
+	Flips               []string        `json:"flips"`
+	Online              bool            `json:"online"`
+	Generation          uint32          `json:"generation"`
+	Code                hexutil.Bytes   `json:"code"`
+	Invitees            []state.TxAddr  `json:"invitees"`
+	Penalty             decimal.Decimal `json:"penalty"`
+	LastValidationFlags []string        `json:"lastValidationFlags"`
 }
 
 func (api *DnaApi) Identities() []Identity {
 	var identities []Identity
 	epoch := api.baseApi.getAppState().State.Epoch()
-	api.baseApi.engine.GetAppState().State.IterateIdentities(func(key []byte, value []byte) bool {
+	api.baseApi.getAppState().State.IterateIdentities(func(key []byte, value []byte) bool {
 		if key == nil {
 			return true
 		}
@@ -234,7 +239,7 @@ func (api *DnaApi) Identities() []Identity {
 	})
 
 	for idx := range identities {
-		identities[idx].Online = api.baseApi.getAppState().ValidatorsCache.IsOnlineIdentity(identities[idx].Address)
+		identities[idx].Online = getIdentityOnlineStatus(api.baseApi.getAppState(), identities[idx].Address)
 	}
 
 	return identities
@@ -249,8 +254,18 @@ func (api *DnaApi) Identity(address *common.Address) Identity {
 	}
 
 	converted := convertIdentity(api.baseApi.getAppState().State.Epoch(), *address, api.baseApi.getAppState().State.GetIdentity(*address), flipKeyWordPairs)
-	converted.Online = api.baseApi.getAppState().ValidatorsCache.IsOnlineIdentity(*address)
+	converted.Online = getIdentityOnlineStatus(api.baseApi.getAppState(), *address)
 	return converted
+}
+
+func getIdentityOnlineStatus(state *appstate.AppState, addr common.Address) bool {
+	isOnline := state.ValidatorsCache.IsOnlineIdentity(addr)
+	hasPendingStatusSwitch := state.State.HasStatusSwitchAddresses(addr)
+	if hasPendingStatusSwitch {
+		return !isOnline
+	} else {
+		return isOnline
+	}
 }
 
 func convertIdentity(currentEpoch uint16, address common.Address, data state.Identity, flipKeyWordPairs []int) Identity {
@@ -258,28 +273,33 @@ func convertIdentity(currentEpoch uint16, address common.Address, data state.Ide
 	switch data.State {
 	case state.Invite:
 		s = "Invite"
-		break
 	case state.Candidate:
 		s = "Candidate"
-		break
 	case state.Newbie:
 		s = "Newbie"
-		break
 	case state.Verified:
 		s = "Verified"
-		break
 	case state.Suspended:
 		s = "Suspended"
-		break
 	case state.Zombie:
 		s = "Zombie"
-		break
 	case state.Killed:
 		s = "Killed"
-		break
+	case state.Human:
+		s = "Human"
 	default:
 		s = "Undefined"
-		break
+	}
+
+	var flags []string
+	if data.LastValidationStatus.HasFlag(state.AllFlipsNotQualified) {
+		flags = append(flags, "AllFlipsNotQualified")
+	}
+	if data.LastValidationStatus.HasFlag(state.AtLeastOneFlipNotQualified) {
+		flags = append(flags, "AtLeastOneFlipNotQualified")
+	}
+	if data.LastValidationStatus.HasFlag(state.AtLeastOneFlipReported) {
+		flags = append(flags, "AtLeastOneFlipReported")
 	}
 
 	var profileHash string
@@ -317,23 +337,25 @@ func convertIdentity(currentEpoch uint16, address common.Address, data state.Ide
 	}
 
 	return Identity{
-		Address:          address,
-		State:            s,
-		Stake:            blockchain.ConvertToFloat(data.Stake),
-		Age:              age,
-		Invites:          data.Invites,
-		ProfileHash:      profileHash,
-		PubKey:           fmt.Sprintf("%x", data.PubKey),
-		RequiredFlips:    data.RequiredFlips,
-		FlipKeyWordPairs: convertedFlipKeyWordPairs,
-		MadeFlips:        uint8(len(data.Flips)),
-		QualifiedFlips:   data.QualifiedFlips,
-		ShortFlipPoints:  data.GetShortFlipPoints(),
-		Flips:            result,
-		Generation:       data.Generation,
-		Code:             data.Code,
-		Invitees:         invitees,
-		Penalty:          blockchain.ConvertToFloat(data.Penalty),
+		Address:             address,
+		State:               s,
+		Stake:               blockchain.ConvertToFloat(data.Stake),
+		Age:                 age,
+		Invites:             data.Invites,
+		ProfileHash:         profileHash,
+		PubKey:              fmt.Sprintf("%x", data.PubKey),
+		RequiredFlips:       data.RequiredFlips,
+		AvailableFlips:      data.GetMaximumAvailableFlips(),
+		FlipKeyWordPairs:    convertedFlipKeyWordPairs,
+		MadeFlips:           uint8(len(data.Flips)),
+		QualifiedFlips:      data.QualifiedFlips,
+		ShortFlipPoints:     data.GetShortFlipPoints(),
+		Flips:               result,
+		Generation:          data.Generation,
+		Code:                data.Code,
+		Invitees:            invitees,
+		Penalty:             blockchain.ConvertToFloat(data.Penalty),
+		LastValidationFlags: flags,
 	}
 }
 
@@ -345,7 +367,7 @@ type Epoch struct {
 }
 
 func (api *DnaApi) Epoch() Epoch {
-	s := api.baseApi.engine.GetAppState()
+	s := api.baseApi.getAppState()
 	var res string
 	switch s.State.ValidationPeriod() {
 	case state.NonePeriod:
@@ -418,9 +440,9 @@ type BurnArgs struct {
 	BaseTxArgs
 }
 
-func (api *DnaApi) Burn(args BurnArgs) (common.Hash, error) {
+func (api *DnaApi) Burn(ctx context.Context, args BurnArgs) (common.Hash, error) {
 	from := api.baseApi.getCurrentCoinbase()
-	hash, err := api.baseApi.sendTx(from, nil, types.BurnTx, args.Amount, args.MaxFee, decimal.Zero, args.Nonce,
+	hash, err := api.baseApi.sendTx(ctx, from, nil, types.BurnTx, args.Amount, args.MaxFee, decimal.Zero, args.Nonce,
 		args.Epoch, attachments.CreateBurnAttachment(args.Key), nil)
 
 	if err != nil {
@@ -446,7 +468,7 @@ type ProfileResponse struct {
 	Nickname string         `json:"nickname"`
 }
 
-func (api *DnaApi) ChangeProfile(args ChangeProfileArgs) (ChangeProfileResponse, error) {
+func (api *DnaApi) ChangeProfile(ctx context.Context, args ChangeProfileArgs) (ChangeProfileResponse, error) {
 	profileData := profile.Profile{}
 	if args.Info != nil && len(*args.Info) > 0 {
 		profileData.Info = *args.Info
@@ -461,7 +483,7 @@ func (api *DnaApi) ChangeProfile(args ChangeProfileArgs) (ChangeProfileResponse,
 		return ChangeProfileResponse{}, errors.Wrap(err, "failed to add profile data")
 	}
 
-	txHash, err := api.baseApi.sendTx(api.baseApi.getCurrentCoinbase(), nil, types.ChangeProfileTx, decimal.Zero,
+	txHash, err := api.baseApi.sendTx(ctx, api.baseApi.getCurrentCoinbase(), nil, types.ChangeProfileTx, decimal.Zero,
 		args.MaxFee, decimal.Zero, 0, 0, attachments.CreateChangeProfileAttachment(profileHash),
 		nil)
 
@@ -499,4 +521,31 @@ func (api *DnaApi) Profile(address *common.Address) (ProfileResponse, error) {
 		Nickname: string(identityProfile.Nickname),
 		Info:     info,
 	}, nil
+}
+
+func (api *DnaApi) Sign(value string) hexutil.Bytes {
+	hash := signatureHash(value)
+	return api.baseApi.secStore.Sign(hash[:])
+}
+
+type SignatureAddressArgs struct {
+	Value     string
+	Signature hexutil.Bytes
+}
+
+func (api *DnaApi) SignatureAddress(args SignatureAddressArgs) (common.Address, error) {
+	hash := signatureHash(args.Value)
+	pubKey, err := crypto.Ecrecover(hash[:], args.Signature)
+	if err != nil {
+		return common.Address{}, err
+	}
+	addr, err := crypto.PubKeyBytesToAddress(pubKey)
+	if err != nil {
+		return common.Address{}, err
+	}
+	return addr, nil
+}
+
+func signatureHash(value string) common.Hash {
+	return rlp.Hash(value)
 }

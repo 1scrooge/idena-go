@@ -16,6 +16,7 @@ import (
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/log"
 	"github.com/idena-network/idena-go/secstore"
+	"github.com/idena-network/idena-go/stats/collector"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"time"
 )
@@ -61,6 +62,7 @@ type Downloader struct {
 	sm                   *state.SnapshotManager
 	bus                  eventbus.Bus
 	secStore             *secstore.SecStore
+	statsCollector       collector.StatsCollector
 }
 
 func (d *Downloader) IsSyncing() bool {
@@ -70,12 +72,22 @@ func (d *Downloader) IsSyncing() bool {
 func (d *Downloader) SyncProgress() (head uint64, top uint64) {
 	height := d.chain.Head.Height()
 	if d.chain.PreliminaryHead != nil {
-		height = math.MaxInt(height, d.chain.PreliminaryHead.Height())
+		height = math.Max(height, d.chain.PreliminaryHead.Height())
 	}
 	return height, d.top
 }
 
-func NewDownloader(pm *IdenaGossipHandler, cfg *config.Config, chain *blockchain.Blockchain, ipfs ipfs.Proxy, appState *appstate.AppState, sm *state.SnapshotManager, bus eventbus.Bus, secStore *secstore.SecStore) *Downloader {
+func NewDownloader(
+	pm *IdenaGossipHandler,
+	cfg *config.Config,
+	chain *blockchain.Blockchain,
+	ipfs ipfs.Proxy,
+	appState *appstate.AppState,
+	sm *state.SnapshotManager,
+	bus eventbus.Bus,
+	secStore *secstore.SecStore,
+	statsCollector collector.StatsCollector,
+) *Downloader {
 	return &Downloader{
 		pm:                   pm,
 		cfg:                  cfg,
@@ -88,6 +100,7 @@ func NewDownloader(pm *IdenaGossipHandler, cfg *config.Config, chain *blockchain
 		sm:                   sm,
 		bus:                  bus,
 		secStore:             secStore,
+		statsCollector:       statsCollector,
 	}
 }
 
@@ -144,7 +157,15 @@ func (d *Downloader) Load() {
 	head := d.chain.Head
 
 	applier, toHeight := d.createBlockApplier()
-	from, _ := applier.preConsuming(head)
+
+	var from uint64
+	var err error
+	if from, err = applier.preConsuming(head); err != nil {
+		d.log.Error("pre consuming error", "err", err)
+		time.Sleep(5 * time.Second)
+		return
+	}
+
 	d.batches = make(chan *batch, 10)
 	term := make(chan interface{})
 	completed := make(chan interface{})
@@ -183,13 +204,29 @@ loop:
 
 func (d *Downloader) consumeBlocks(applier blockApplier, term chan interface{}, completed chan interface{}) {
 	defer close(term)
+
+	consume := func(batch *batch) (stop bool) {
+		if len(batch.headers) == 0 && !d.pm.IsConnected(batch.p.id) {
+			batch = requestBatch(d.pm, batch.from, batch.to, batch.p.id)
+			if batch == nil {
+				d.log.Warn("failed to process batch", "err", "no peers")
+				return true
+			}
+		}
+
+		if err := applier.processBatch(batch, 1); err != nil {
+			d.log.Warn("failed to process batch", "err", err)
+			return true
+		}
+		return false
+	}
+
 	for {
 		timeout := time.After(time.Second * 15)
 
 		select {
 		case batch := <-d.batches:
-			if err := applier.processBatch(batch, 1); err != nil {
-				d.log.Warn("failed to process batch", "err", err)
+			if consume(batch) {
 				return
 			}
 			continue
@@ -198,8 +235,7 @@ func (d *Downloader) consumeBlocks(applier blockApplier, term chan interface{}, 
 
 		select {
 		case batch := <-d.batches:
-			if err := applier.processBatch(batch, 1); err != nil {
-				d.log.Warn("failed to process batch", "err", err)
+			if consume(batch) {
 				return
 			}
 			break
@@ -211,34 +247,12 @@ func (d *Downloader) consumeBlocks(applier blockApplier, term chan interface{}, 
 	}
 }
 
-func (d *Downloader) GetBlock(header *types.Header) (*types.Block, error) {
-	if header.EmptyBlockHeader != nil {
-		return &types.Block{
-			Header: header,
-			Body:   &types.Body{},
-		}, nil
-	}
-	if txs, err := d.ipfs.Get(header.ProposedHeader.IpfsHash); err != nil {
-		return nil, err
-	} else {
-		if len(txs) > 0 {
-			d.log.Debug("Retrieve block body from ipfs", "hash", header.Hash().Hex())
-		}
-		body := &types.Body{}
-		body.FromBytes(txs)
-		return &types.Block{
-			Header: header,
-			Body:   body,
-		}, nil
-	}
-}
-
 func (d *Downloader) SeekBlocks(fromBlock, toBlock uint64, peers []peer.ID) chan *types.BlockBundle {
-	return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, 0).SeekBlocks(fromBlock, toBlock, peers)
+	return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, 0, d.statsCollector).SeekBlocks(fromBlock, toBlock, peers)
 }
 
 func (d *Downloader) SeekForkedBlocks(ownBlocks []common.Hash, peerId peer.ID) chan types.BlockBundle {
-	return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, 0).SeekForkedBlocks(ownBlocks, peerId)
+	return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, 0, d.statsCollector).SeekForkedBlocks(ownBlocks, peerId)
 }
 
 func (d *Downloader) HasPotentialFork() bool {
@@ -274,7 +288,7 @@ func (d *Downloader) createBlockApplier() (loader blockApplier, toHeight uint64)
 	} else {
 		d.log.Info("Full sync will be used")
 		top := d.top
-		return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, top), top
+		return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, top, d.statsCollector), top
 	}
 }
 
@@ -322,4 +336,21 @@ func (d *Downloader) BanPeer(peerId peer.ID, reason error) {
 	if d.pm != nil {
 		d.pm.BanPeer(peerId, reason)
 	}
+}
+
+func requestBatch(pm *IdenaGossipHandler, from, to uint64, ignoredPeer peer.ID) *batch {
+	knownHeights := pm.GetKnownHeights()
+	if knownHeights == nil {
+		return nil
+	}
+	for peerId, height := range knownHeights {
+		if (peerId != ignoredPeer || len(knownHeights) == 1) && height >= to {
+			if batch, err := pm.GetBlocksRange(peerId, from, to); err != nil {
+				continue
+			} else {
+				return batch
+			}
+		}
+	}
+	return nil
 }

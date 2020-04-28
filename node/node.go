@@ -39,12 +39,6 @@ import (
 	"github.com/tendermint/tm-db"
 )
 
-const (
-	// todo set real values
-	totalTxLimit = 100000
-	addrTxLimit  = 1000
-)
-
 type Node struct {
 	config          *config.Config
 	blockchain      *blockchain.Blockchain
@@ -119,14 +113,14 @@ func ProvideMobileKey(path string, cfg string, key string, password string) stri
 }
 
 func NewNode(config *config.Config, appVersion string) (*Node, error) {
-	nodeCtx, err := NewNodeWithInjections(config, eventbus.New(), collector.NewBlockStatsCollector(), appVersion)
+	nodeCtx, err := NewNodeWithInjections(config, eventbus.New(), collector.NewStatsCollector(), appVersion)
 	if err != nil {
 		return nil, err
 	}
 	return nodeCtx.Node, err
 }
 
-func NewNodeWithInjections(config *config.Config, bus eventbus.Bus, blockStatsCollector collector.BlockStatsCollector, appVersion string) (*NodeCtx, error) {
+func NewNodeWithInjections(config *config.Config, bus eventbus.Bus, statsCollector collector.StatsCollector, appVersion string) (*NodeCtx, error) {
 
 	db, err := OpenDatabase(config.DataDir, "idenachain", 16, 16)
 
@@ -153,19 +147,20 @@ func NewNodeWithInjections(config *config.Config, bus eventbus.Bus, blockStatsCo
 	secStore := secstore.NewSecStore()
 	appState := appstate.NewAppState(db, bus)
 
-	offlineDetector := blockchain.NewOfflineDetector(config.OfflineDetection, db, appState, secStore, bus)
+	offlineDetector := blockchain.NewOfflineDetector(config, db, appState, secStore, bus)
 	votes := pengings.NewVotes(appState, bus, offlineDetector)
 
-	txpool := mempool.NewTxPool(appState, bus, totalTxLimit, addrTxLimit, config.Consensus.MinFeePerByte)
-	flipKeyPool := mempool.NewKeysPool(db, appState, bus, secStore, ipfsProxy)
+	txpool := mempool.NewTxPool(appState, bus, config.Mempool, config.Consensus.MinFeePerByte)
+	flipKeyPool := mempool.NewKeysPool(db, appState, bus, secStore)
 
-	chain := blockchain.NewBlockchain(config, db, txpool, appState, ipfsProxy, secStore, bus, offlineDetector, blockStatsCollector)
-	proposals, proofsByRound, pendingProofs := pengings.NewProposals(chain, offlineDetector)
+	chain := blockchain.NewBlockchain(config, db, txpool, appState, ipfsProxy, secStore, bus, offlineDetector, keyStore)
+	proposals, proofsByRound, pendingProofs := pengings.NewProposals(chain, appState, offlineDetector)
 	flipper := flip.NewFlipper(db, ipfsProxy, flipKeyPool, txpool, secStore, appState, bus)
 	pm := protocol.NewIdenaGossipHandler(ipfsProxy.Host(), config.P2P, chain, proposals, votes, txpool, flipper, bus, flipKeyPool, appVersion)
 	sm := state.NewSnapshotManager(db, appState.State, bus, ipfsProxy, config)
-	downloader := protocol.NewDownloader(pm, config, chain, ipfsProxy, appState, sm, bus, secStore)
-	consensusEngine := consensus.NewEngine(chain, pm, proposals, config.Consensus, appState, votes, txpool, secStore, downloader, offlineDetector)
+	downloader := protocol.NewDownloader(pm, config, chain, ipfsProxy, appState, sm, bus, secStore, statsCollector)
+	consensusEngine := consensus.NewEngine(chain, pm, proposals, config.Consensus, appState, votes, txpool, secStore,
+		downloader, offlineDetector, statsCollector)
 	ceremony := ceremony.NewValidationCeremony(appState, bus, flipper, secStore, db, txpool, chain, downloader, flipKeyPool, config)
 	profileManager := profile.NewProfileManager(ipfsProxy)
 	node := &Node{

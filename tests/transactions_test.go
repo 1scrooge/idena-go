@@ -37,12 +37,12 @@ func TestTransactions_EpochChanging(t *testing.T) {
 		State:   uint8(state.Invite),
 	}
 
-	conf := blockchain.GetDefaultConsensusConfig(false)
+	conf := config.GetDefaultConsensusConfig()
 	conf.FinalCommitteeReward = big.NewInt(0)
 	valConf := &config.ValidationConfig{}
 	valConf.ValidationInterval = time.Minute * 1
 
-	chain, appState, pool, _ := blockchain.NewTestBlockchainWithConfig(true, conf, valConf, alloc, -1, -1)
+	chain, appState, pool, _ := blockchain.NewTestBlockchainWithConfig(true, conf, valConf, alloc, -1, -1, 0, 0)
 
 	tx1 := generateTx(getAmount(12), addr2, 1, 0, key1)
 	tx2 := generateTx(getAmount(88), addr1, 1, 0, key2)
@@ -64,13 +64,13 @@ func TestTransactions_EpochChanging(t *testing.T) {
 	require.NoError(pool.Add(tx3))
 
 	block := chain.ProposeBlock()
-	require.NoError(chain.AddBlock(block, nil))
+	require.NoError(chain.AddBlock(block.Block, nil, nil))
 	require.Equal(appState.State.GetBalance(addr1), new(big.Int).Sub(receive1, spend1))
 	require.Equal(appState.State.GetBalance(addr2), new(big.Int).Sub(receive2, spend2))
 
 	//new epoch
 	block = chain.ProposeBlock()
-	require.NoError(chain.AddBlock(block, nil))
+	require.NoError(chain.AddBlock(block.Block, nil, nil))
 
 	// new epoch started
 	tx1 = generateTx(getAmount(15), addr2, 1, 1, key1)
@@ -85,7 +85,7 @@ func TestTransactions_EpochChanging(t *testing.T) {
 	require.NoError(pool.Add(tx2))
 
 	block = chain.ProposeBlock()
-	require.NoError(chain.AddBlock(block, nil))
+	require.NoError(chain.AddBlock(block.Block, nil, nil))
 
 	require.Equal(1, len(block.Body.Transactions))
 

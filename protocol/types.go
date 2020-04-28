@@ -15,8 +15,6 @@ const (
 	IdenaProtocolWeight        = 25
 	ReconnectAfterDiscTimeout  = time.Minute * 1
 	ReconnectAfterResetTimeout = time.Minute * 3
-	MaxMempoolSyncs            = 10
-	ExtraSyncThreshold         = 0.9
 )
 
 type request struct {
@@ -37,14 +35,6 @@ func (msg *Msg) Decode(val interface{}) error {
 }
 
 type handshakeData struct {
-	NetworkId    types.Network
-	Height       uint64
-	GenesisBlock common.Hash
-	Timestamp    uint64
-	AppVersion   string
-}
-
-type handshakeDataV2 struct {
 	NetworkId    types.Network
 	Height       uint64
 	GenesisBlock common.Hash
@@ -75,6 +65,26 @@ type proposeProof struct {
 	Round  uint64
 }
 
-type flipCid struct {
-	Cid []byte
+type pushType uint8
+
+const (
+	pushVote       pushType = 1
+	pushBlock      pushType = 2
+	pushProof      pushType = 3
+	pushFlip       pushType = 4
+	pushKeyPackage pushType = 5
+	pushTx         pushType = 6
+)
+
+type pushPullHash struct {
+	Type pushType
+	Hash common.Hash128
+}
+
+func (h *pushPullHash) String() string {
+	return string(h.Type) + string(h.Hash.Bytes())
+}
+
+func (h *pushPullHash) Invalid() bool {
+	return h.Type < pushVote || h.Type > pushTx
 }

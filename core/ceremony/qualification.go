@@ -123,7 +123,7 @@ func (q *qualification) qualifyFlips(totalFlipsCount uint, candidates []*candida
 }
 
 func (q *qualification) qualifyCandidate(candidate common.Address, flipQualificationMap map[int]FlipQualification,
-	flipsToSolve []int, shortSession bool, notApprovedFlips mapset.Set) (point float32, qualifiedFlipsCount uint32, flipAnswers map[int]statsTypes.FlipAnswerStats, noQual bool) {
+	flipsToSolve []int, shortSession bool, notApprovedFlips mapset.Set) (point float32, qualifiedFlipsCount uint32, flipAnswers map[int]statsTypes.FlipAnswerStats, noQual bool, noAnswer bool) {
 
 	var answerBytes []byte
 	if shortSession {
@@ -134,7 +134,7 @@ func (q *qualification) qualifyCandidate(candidate common.Address, flipQualifica
 
 	// candidate didn't send answers
 	if answerBytes == nil {
-		return 0, 0, nil, false
+		return 0, 0, nil, false, true
 	}
 
 	if shortSession {
@@ -142,12 +142,12 @@ func (q *qualification) qualifyCandidate(candidate common.Address, flipQualifica
 		flipsCount := uint32(math.MinInt(int(common.ShortSessionFlipsCount()), len(flipsToSolve)))
 		// can't parse
 		if attachment == nil {
-			return 0, flipsCount, nil, false
+			return 0, flipsCount, nil, false, false
 		}
 		hash := q.epochDb.GetAnswerHash(candidate)
 		answerBytes = attachment.Answers
 		if answerBytes == nil || hash != rlp.Hash(append(answerBytes, attachment.Salt...)) {
-			return 0, flipsCount, nil, false
+			return 0, flipsCount, nil, false, false
 		}
 	}
 
@@ -167,7 +167,7 @@ func (q *qualification) qualifyCandidate(candidate common.Address, flipQualifica
 	for i, flipIdx := range flipsToSolve {
 		qual := flipQualificationMap[flipIdx]
 		status := getFlipStatusForCandidate(flipIdx, i, qual.status, notApprovedFlips, answers, shortSession)
-		answer, _ := answers.Answer(uint(i))
+		answer, wrongWords := answers.Answer(uint(i))
 
 		//extra flip
 		if shortSession && i >= int(common.ShortSessionFlipsCount()) {
@@ -204,9 +204,10 @@ func (q *qualification) qualifyCandidate(candidate common.Address, flipQualifica
 			Respondent: candidate,
 			Answer:     answer,
 			Point:      answerPoint,
+			WrongWords: wrongWords,
 		}
 	}
-	return point, qualifiedFlipsCount, flipAnswers, qualifiedFlipsCount == 0
+	return point, qualifiedFlipsCount, flipAnswers, qualifiedFlipsCount == 0, false
 }
 
 func (q *qualification) GetProof(addr common.Address) []byte {

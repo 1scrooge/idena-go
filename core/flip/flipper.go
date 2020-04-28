@@ -27,10 +27,6 @@ import (
 	"time"
 )
 
-const (
-	MaxFlipSize = 1024 * 600
-)
-
 var (
 	DuplicateFlipError = errors.New("duplicate flip")
 )
@@ -120,8 +116,8 @@ func (fp *Flipper) addNewFlip(flip *types.Flip, local bool) error {
 
 	data, _ := rlp.EncodeToBytes(ipf)
 
-	if len(data) > MaxFlipSize {
-		return errors.Errorf("flip is too big, max expected size %v, actual %v", MaxFlipSize, len(data))
+	if len(data) > common.MaxFlipSize {
+		return errors.Errorf("flip is too big, max expected size %v, actual %v", common.MaxFlipSize, len(data))
 	}
 
 	c, err := fp.ipfsProxy.Cid(data)
@@ -149,7 +145,7 @@ func (fp *Flipper) addNewFlip(flip *types.Flip, local bool) error {
 		return err
 	}
 
-	key, err := fp.ipfsProxy.Add(data)
+	_, err = fp.ipfsProxy.Add(data, fp.ipfsProxy.ShouldPin(ipfs.Flip) || local)
 
 	if err != nil {
 		return err
@@ -157,14 +153,12 @@ func (fp *Flipper) addNewFlip(flip *types.Flip, local bool) error {
 
 	fp.flipsCache.Add(string(c.Bytes()), flip, cache.DefaultExpiration)
 
-	fp.bus.Publish(&events.NewFlipEvent{FlipCid: c.Bytes()})
+	fp.bus.Publish(&events.NewFlipEvent{Flip: flip})
 
 	fp.epochDb.WriteFlipCid(c.Bytes())
 
 	if local {
-		if err := fp.ipfsProxy.Pin(key.Bytes()); err != nil {
-			return err
-		}
+		log.Info("Sending new flip tx", "hash", flip.Tx.Hash().Hex(), "nonce", flip.Tx.AccountNonce, "epoch", flip.Tx.Epoch)
 	}
 
 	if err := fp.txpool.Add(flip.Tx); err != nil && err != mempool.DuplicateTxError {
@@ -321,7 +315,7 @@ func (fp *Flipper) Load(cids [][]byte) {
 
 		cid, _ := cid.Cast(key)
 
-		data, err := fp.ipfsProxy.Get(key)
+		data, err := fp.ipfsProxy.Get(key, ipfs.Flip)
 
 		if err != nil {
 			fp.log.Warn("Can't get flip by cid", "cid", cid.String(), "err", err)
@@ -366,8 +360,8 @@ func (fp *Flipper) HasFlips() bool {
 	return fp.hasFlips
 }
 
-func (fp *Flipper) IsFlipReady(cid []byte) bool {
-	hash := common.Hash(rlp.Hash(cid))
+func (fp *Flipper) IsFlipReady(key []byte) bool {
+	hash := common.Hash(rlp.Hash(key))
 
 	fp.mutex.Lock()
 	flip := fp.flips[hash]
@@ -379,11 +373,14 @@ func (fp *Flipper) IsFlipReady(cid []byte) bool {
 	}
 
 	if !isReady {
-		if _, _, err := fp.GetFlip(cid); err == nil {
+		if _, _, err := fp.GetFlip(key); err == nil {
 			fp.mutex.Lock()
 			isReady = true
 			fp.flipReadiness[hash] = true
 			fp.mutex.Unlock()
+		} else {
+			c, _ := cid.Cast(key)
+			log.Warn("flip is not ready", "err", err, "cid", c.String())
 		}
 	}
 
@@ -395,7 +392,7 @@ func (fp *Flipper) UnpinFlip(flipCid []byte) {
 }
 
 func (fp *Flipper) GetRawFlip(flipCid []byte) (*IpfsFlip, error) {
-	data, err := fp.ipfsProxy.Get(flipCid)
+	data, err := fp.ipfsProxy.Get(flipCid, ipfs.Flip)
 	if err != nil {
 		return nil, err
 	}

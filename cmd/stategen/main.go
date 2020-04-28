@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/go-bindata/go-bindata/v3"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/common/eventbus"
 	"github.com/idena-network/idena-go/config"
@@ -9,9 +10,8 @@ import (
 	"github.com/idena-network/idena-go/database"
 	"github.com/idena-network/idena-go/log"
 	"github.com/idena-network/idena-go/rlp"
-	"github.com/jteeuwen/go-bindata"
 	"github.com/pkg/errors"
-	"gopkg.in/urfave/cli.v1"
+	"github.com/urfave/cli"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -74,6 +74,11 @@ func main() {
 			FeePerByte:           globalObject.FeePerByte(),
 			VrfProposerThreshold: globalObject.VrfProposerThresholdRaw(),
 			EmptyBlocksBits:      globalObject.EmptyBlocksBits(),
+			GodAddressInvites:    globalObject.GodAddressInvites(),
+		}
+
+		snapshot.StatusSwitch = state.StateStatusSwitch{
+			Addresses: nil,
 		}
 
 		appState.State.IterateAccounts(func(key []byte, value []byte) bool {
@@ -119,22 +124,24 @@ func main() {
 			}
 
 			snapshot.Identities = append(snapshot.Identities, &state.StateIdentity{
-				Address:         addr,
-				State:           data.State,
-				Birthday:        data.Birthday,
-				Code:            data.Code,
-				Generation:      data.Generation,
-				Invites:         data.Invites,
-				ProfileHash:     data.ProfileHash,
-				PubKey:          data.PubKey,
-				QualifiedFlips:  data.QualifiedFlips,
-				RequiredFlips:   data.RequiredFlips,
-				ShortFlipPoints: data.ShortFlipPoints,
-				Stake:           data.Stake,
-				Flips:           flips,
-				Invitees:        data.Invitees,
-				Inviter:         data.Inviter,
-				Penalty:         data.Penalty,
+				Address:              addr,
+				State:                data.State,
+				Birthday:             data.Birthday,
+				Code:                 data.Code,
+				Generation:           data.Generation,
+				Invites:              data.Invites,
+				ProfileHash:          data.ProfileHash,
+				PubKey:               data.PubKey,
+				QualifiedFlips:       data.QualifiedFlips,
+				RequiredFlips:        data.RequiredFlips,
+				ShortFlipPoints:      data.ShortFlipPoints,
+				Stake:                data.Stake,
+				Flips:                flips,
+				Invitees:             data.Invitees,
+				Inviter:              data.Inviter,
+				Penalty:              data.Penalty,
+				ValidationTxsBits:    data.ValidationTxsBits,
+				LastValidationStatus: data.LastValidationStatus,
 			})
 			return false
 		})
@@ -158,6 +165,7 @@ func main() {
 			})
 			return false
 		})
+
 		file, err := os.Create("stategen.out")
 		if err != nil {
 			return err

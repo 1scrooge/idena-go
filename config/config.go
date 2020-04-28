@@ -10,7 +10,7 @@ import (
 	"github.com/idena-network/idena-go/log"
 	"github.com/idena-network/idena-go/rpc"
 	"github.com/pkg/errors"
-	"gopkg.in/urfave/cli.v1"
+	"github.com/urfave/cli"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -35,6 +35,7 @@ type Config struct {
 	Sync             *SyncConfig
 	OfflineDetection *OfflineDetectionConfig
 	Blockchain       *BlockchainConfig
+	Mempool          *Mempool
 }
 
 func (c *Config) ProvideNodeKey(key string, password string, withBackup bool) error {
@@ -222,6 +223,12 @@ func MakeConfigFromFile(file string) (*Config, error) {
 
 func getDefaultConfig(dataDir string) *Config {
 
+	ipfsConfig := GetDefaultIpfsConfig()
+	ipfsConfig.DataDir = filepath.Join(dataDir, DefaultIpfsDataDir)
+	ipfsConfig.IpfsPort = DefaultIpfsPort
+	ipfsConfig.BootNodes = DefaultIpfsBootstrapNodes
+	ipfsConfig.SwarmKey = DefaultSwarmKey
+
 	return &Config{
 		DataDir: dataDir,
 		Network: 0x1, // testnet
@@ -236,12 +243,7 @@ func getDefaultConfig(dataDir string) *Config {
 			FirstCeremonyTime: DefaultCeremonyTime,
 			GodAddress:        common.HexToAddress(DefaultGodAddress),
 		},
-		IpfsConf: &IpfsConfig{
-			DataDir:   filepath.Join(dataDir, DefaultIpfsDataDir),
-			IpfsPort:  DefaultIpfsPort,
-			BootNodes: DefaultIpfsBootstrapNodes,
-			SwarmKey:  DefaultSwarmKey,
-		},
+		IpfsConf:   ipfsConfig,
 		Validation: &ValidationConfig{},
 		Sync: &SyncConfig{
 			FastSync:      true,
@@ -252,6 +254,7 @@ func getDefaultConfig(dataDir string) *Config {
 			StoreCertRange: DefaultStoreCertRange,
 			BurnTxRange:    DefaultBurntTxRange,
 		},
+		Mempool: GetDefaultMempoolConfig(),
 	}
 }
 

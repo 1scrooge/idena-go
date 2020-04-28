@@ -9,6 +9,7 @@ import (
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/log"
+	"github.com/idena-network/idena-go/stats/collector"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/pkg/errors"
 	"time"
@@ -32,13 +33,23 @@ type fullSync struct {
 	potentialForkedPeers mapset.Set
 	deferredHeaders      []blockPeer
 	targetHeight         uint64
+	statsCollector       collector.StatsCollector
 }
 
 func (fs *fullSync) batchSize() uint64 {
 	return FullSyncBatchSize
 }
 
-func NewFullSync(pm *IdenaGossipHandler, log log.Logger, chain *blockchain.Blockchain, ipfs ipfs.Proxy, appState *appstate.AppState, potentialForkedPeers mapset.Set, targetHeight uint64) *fullSync {
+func NewFullSync(
+	pm *IdenaGossipHandler,
+	log log.Logger,
+	chain *blockchain.Blockchain,
+	ipfs ipfs.Proxy,
+	appState *appstate.AppState,
+	potentialForkedPeers mapset.Set,
+	targetHeight uint64,
+	statsCollector collector.StatsCollector,
+) *fullSync {
 
 	return &fullSync{
 		appState:             appState,
@@ -50,24 +61,8 @@ func NewFullSync(pm *IdenaGossipHandler, log log.Logger, chain *blockchain.Block
 		isSyncing:            true,
 		ipfs:                 ipfs,
 		targetHeight:         targetHeight,
+		statsCollector:       statsCollector,
 	}
-}
-
-func (fs *fullSync) requestBatch(from, to uint64, ignoredPeer peer.ID) *batch {
-	knownHeights := fs.pm.GetKnownHeights()
-	if knownHeights == nil {
-		return nil
-	}
-	for peerId, height := range knownHeights {
-		if (peerId != ignoredPeer || len(knownHeights) == 1) && height >= to {
-			if batch, err := fs.pm.GetBlocksRange(peerId, from, to); err != nil {
-				continue
-			} else {
-				return batch
-			}
-		}
-	}
-	return nil
 }
 
 func (fs *fullSync) applyDeferredBlocks(checkState *appstate.AppState) (uint64, error) {
@@ -86,7 +81,7 @@ func (fs *fullSync) applyDeferredBlocks(checkState *appstate.AppState) (uint64, 
 					return block.Height(), errors.Wrap(err, "cannot switch state tree to defaults")
 				}
 			}*/
-			if err := fs.chain.AddBlock(block, checkState); err != nil {
+			if err := fs.chain.AddBlock(block, checkState, fs.statsCollector); err != nil {
 				if err := fs.appState.ResetTo(fs.chain.Head.Height()); err != nil {
 					return block.Height(), err
 				}
@@ -134,13 +129,13 @@ func (fs *fullSync) processBatch(batch *batch, attemptNum int) error {
 		return errors.New("number of attempts exceeded limit")
 	}
 
-	checkState, err := fs.appState.ForCheckWithNewCache(fs.chain.Head.Height())
+	checkState, err := fs.appState.ForCheckWithOverwrite(fs.chain.Head.Height())
 	if err != nil {
 		return err
 	}
 
 	reload := func(from uint64) error {
-		b := fs.requestBatch(from, batch.to, batch.p.id)
+		b := requestBatch(fs.pm, from, batch.to, batch.p.id)
 		if b == nil {
 			return errors.New(fmt.Sprintf("Batch (%v-%v) can't be loaded", from, batch.to))
 		}
@@ -168,7 +163,7 @@ func (fs *fullSync) processBatch(batch *batch, attemptNum int) error {
 				return reload(i)
 			}
 			fs.deferredHeaders = append(fs.deferredHeaders, blockPeer{*block, batch.p.id})
-			if block.Cert != nil && block.Cert.Len() > 0 {
+			if block.Cert != nil && !block.Cert.Empty() {
 				if from, err := fs.applyDeferredBlocks(checkState); err != nil {
 					return reload(from)
 				}
@@ -215,7 +210,7 @@ func (fs *fullSync) GetBlock(header *types.Header) (*types.Block, error) {
 			Body:   &types.Body{},
 		}, nil
 	}
-	if txs, err := fs.ipfs.Get(header.ProposedHeader.IpfsHash); err != nil {
+	if txs, err := fs.ipfs.Get(header.ProposedHeader.IpfsHash, ipfs.Block); err != nil {
 		return nil, err
 	} else {
 		if len(txs) > 0 {

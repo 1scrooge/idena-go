@@ -1,9 +1,11 @@
 package blockchain
 
 import (
+	"fmt"
 	"github.com/idena-network/idena-go/blockchain/attachments"
 	fee2 "github.com/idena-network/idena-go/blockchain/fee"
 	"github.com/idena-network/idena-go/blockchain/types"
+	"github.com/idena-network/idena-go/blockchain/validation"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/common/math"
 	"github.com/idena-network/idena-go/config"
@@ -26,7 +28,6 @@ func Test_ApplyBlockRewards(t *testing.T) {
 		Time:           new(big.Int).SetInt64(time.Now().UTC().Unix()),
 		ProposerPubKey: chain.pubKey,
 		TxHash:         types.DeriveSha(types.Transactions([]*types.Transaction{})),
-		Coinbase:       chain.coinBaseAddress,
 	}
 
 	block := &types.Block{
@@ -41,8 +42,8 @@ func Test_ApplyBlockRewards(t *testing.T) {
 	fee.Mul(big.NewInt(1e+18), big.NewInt(100))
 	tips := new(big.Int).Mul(big.NewInt(1e+18), big.NewInt(10))
 
-	appState := chain.appState.Readonly(1)
-	chain.applyBlockRewards(fee, tips, appState, block, chain.Head)
+	appState, _ := chain.appState.ForCheck(1)
+	chain.applyBlockRewards(fee, tips, appState, block, chain.Head, nil)
 
 	burnFee := decimal.NewFromBigInt(fee, 0)
 	coef := decimal.NewFromFloat32(0.9)
@@ -53,14 +54,12 @@ func Test_ApplyBlockRewards(t *testing.T) {
 	intFeeReward.Sub(fee, intBurn)
 
 	totalReward := big.NewInt(0).Add(chain.config.Consensus.BlockReward, intFeeReward)
+	totalReward.Add(totalReward, chain.config.Consensus.FinalCommitteeReward)
 	totalReward.Add(totalReward, tips)
-	_, stake := splitReward(totalReward, chain.config.Consensus)
 
-	expectedBalance := big.NewInt(0)
-	expectedBalance.Add(expectedBalance, chain.config.Consensus.BlockReward)
-	expectedBalance.Add(expectedBalance, intFeeReward)
-	expectedBalance.Add(expectedBalance, tips)
-	expectedBalance.Sub(expectedBalance, stake)
+	expectedBalance, stake := splitReward(totalReward, false, chain.config.Consensus)
+
+	fmt.Printf("%v\n%v", expectedBalance, appState.State.GetBalance(chain.coinBaseAddress))
 
 	require.Equal(t, 0, expectedBalance.Cmp(appState.State.GetBalance(chain.coinBaseAddress)))
 	require.Equal(t, 0, stake.Cmp(appState.State.GetStakeBalance(chain.coinBaseAddress)))
@@ -92,7 +91,7 @@ func Test_ApplyInviteTx(t *testing.T) {
 
 	signed, _ := types.SignTx(tx, key)
 
-	chain.ApplyTxOnState(chain.appState, signed)
+	chain.ApplyTxOnState(chain.appState, signed, nil)
 
 	require.Equal(t, uint8(0), stateDb.GetInvites(addr))
 	require.Equal(t, state.Invite, stateDb.GetIdentityState(receiver))
@@ -124,7 +123,7 @@ func Test_ApplyActivateTx(t *testing.T) {
 
 	signed, _ := types.SignTx(tx, key)
 
-	chain.ApplyTxOnState(chain.appState, signed)
+	chain.ApplyTxOnState(chain.appState, signed, nil)
 	require.Equal(t, state.Killed, appState.State.GetIdentityState(sender))
 	require.Equal(t, 0, big.NewInt(0).Cmp(appState.State.GetBalance(sender)))
 
@@ -166,12 +165,53 @@ func Test_ApplyKillTx(t *testing.T) {
 	chain.appState.State.SetFeePerByte(new(big.Int).Div(big.NewInt(1e+18), big.NewInt(1000)))
 	fee := fee2.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), chain.appState.State.FeePerByte(), tx)
 
-	chain.ApplyTxOnState(chain.appState, signed)
+	chain.ApplyTxOnState(chain.appState, signed, nil)
 
 	require.Equal(state.Killed, appState.State.GetIdentityState(sender))
 	require.Equal(new(big.Int).Sub(balance, amount), appState.State.GetBalance(sender))
 
 	require.Equal(new(big.Int).Add(new(big.Int).Sub(stake, fee), amount), appState.State.GetBalance(receiver))
+}
+
+func Test_ApplyDoubleKillTx(t *testing.T) {
+	require := require.New(t)
+	chain, appState, _, _ := NewTestBlockchain(true, nil)
+
+	key, _ := crypto.GenerateKey()
+	key2, _ := crypto.GenerateKey()
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	receiver := crypto.PubkeyToAddress(key2.PublicKey)
+
+	stake := new(big.Int).Mul(big.NewInt(100), common.DnaBase)
+
+	id := appState.State.GetOrNewIdentityObject(sender)
+	id.SetStake(stake)
+	id.SetState(state.Invite)
+
+	tx1 := &types.Transaction{
+		Type:         types.KillTx,
+		AccountNonce: 1,
+		To:           &receiver,
+		MaxFee:       common.DnaBase,
+	}
+	tx2 := &types.Transaction{
+		Type:         types.KillTx,
+		AccountNonce: 2,
+		To:           &receiver,
+		MaxFee:       common.DnaBase,
+	}
+
+	signedTx1, _ := types.SignTx(tx1, key)
+	signedTx2, _ := types.SignTx(tx2, key)
+
+	chain.appState.State.SetFeePerByte(chain.config.Consensus.MinFeePerByte)
+	require.Nil(validation.ValidateTx(chain.appState, signedTx1, chain.config.Consensus.MinFeePerByte, validation.InBlockTx))
+	require.Nil(validation.ValidateTx(chain.appState, signedTx2, chain.config.Consensus.MinFeePerByte, validation.InBlockTx))
+
+	_, err := chain.ApplyTxOnState(chain.appState, signedTx1, nil)
+
+	require.Nil(err)
+	require.Equal(validation.InsufficientFunds, validation.ValidateTx(chain.appState, signedTx2, chain.config.Consensus.MinFeePerByte, validation.InBlockTx))
 }
 
 func Test_ApplyKillInviteeTx(t *testing.T) {
@@ -189,7 +229,7 @@ func Test_ApplyKillInviteeTx(t *testing.T) {
 
 	appState.State.SetInvites(inviter, 0)
 	appState.State.SetState(inviter, state.Verified)
-	appState.State.SetState(invitee, state.Candidate)
+	appState.State.SetState(invitee, state.Newbie)
 
 	appState.State.GetOrNewAccountObject(inviter).SetBalance(new(big.Int).Mul(big.NewInt(50), common.DnaBase))
 	appState.State.GetOrNewIdentityObject(invitee).SetStake(new(big.Int).Mul(big.NewInt(10), common.DnaBase))
@@ -204,9 +244,9 @@ func Test_ApplyKillInviteeTx(t *testing.T) {
 	chain.appState.State.SetFeePerByte(new(big.Int).Div(big.NewInt(1e+18), big.NewInt(1000)))
 	fee := fee2.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), chain.appState.State.FeePerByte(), tx)
 
-	chain.ApplyTxOnState(chain.appState, signedTx)
+	chain.ApplyTxOnState(chain.appState, signedTx, nil)
 
-	require.Equal(t, uint8(1), appState.State.GetInvites(inviter))
+	require.Equal(t, uint8(0), appState.State.GetInvites(inviter))
 	require.Equal(t, 1, len(appState.State.GetInvitees(inviter)))
 	require.Equal(t, anotherInvitee, appState.State.GetInvitees(inviter)[0].Address)
 	newBalance := new(big.Int).Mul(big.NewInt(60), common.DnaBase)
@@ -268,11 +308,11 @@ func Test_CalculatePenalty(t *testing.T) {
 }
 
 func Test_applyNextBlockFee(t *testing.T) {
-	conf := GetDefaultConsensusConfig(false)
+	conf := config.GetDefaultConsensusConfig()
 	conf.MinFeePerByte = big.NewInt(0).Div(common.DnaBase, big.NewInt(100))
-	chain, _, _, _ := NewTestBlockchainWithConfig(true, conf, &config.ValidationConfig{}, nil, -1, -1)
+	chain, _, _, _ := NewTestBlockchainWithConfig(true, conf, &config.ValidationConfig{}, nil, -1, -1, 0, 0)
 
-	appState := chain.appState.Readonly(1)
+	appState, _ := chain.appState.ForCheck(1)
 
 	block := generateBlock(4, 10000) // block size 770008
 	chain.applyNextBlockFee(appState, block)
@@ -288,103 +328,23 @@ func Test_applyNextBlockFee(t *testing.T) {
 }
 
 func Test_applyVrfProposerThreshold(t *testing.T) {
-	conf := GetDefaultConsensusConfig(false)
+	conf := config.GetDefaultConsensusConfig()
 	conf.MinFeePerByte = big.NewInt(0).Div(common.DnaBase, big.NewInt(100))
 	chain, _ := NewTestBlockchainWithBlocks(100, 0)
 
 	chain.GenerateEmptyBlocks(10)
-	require.Equal(t, 0.4, chain.appState.State.EmptyBlocksRatio())
+	require.Equal(t, 10, chain.appState.State.EmptyBlocksCount())
 
 	chain.GenerateBlocks(5)
-	require.Equal(t, 0.4, chain.appState.State.EmptyBlocksRatio())
+	require.Equal(t, 10, chain.appState.State.EmptyBlocksCount())
 
 	chain.GenerateBlocks(100)
-	require.Equal(t, 0.9999, chain.appState.State.VrfProposerThreshold())
-
-	chain.GenerateEmptyBlocks(3)
-	require.Equal(t, 0.9979002, chain.appState.State.VrfProposerThreshold())
-
-	chain.GenerateBlocks(23)
-	th := chain.appState.State.VrfProposerThreshold()
-	chain.GenerateBlocks(1)
-
-	require.Equal(t, th, chain.appState.State.VrfProposerThreshold())
+	require.Equal(t, 0.5, chain.appState.State.VrfProposerThreshold())
 }
 
 type txWithTimestamp struct {
 	tx        *types.Transaction
 	timestamp uint64
-}
-
-func TestBlockchain_SaveTxs(t *testing.T) {
-	require := require.New(t)
-
-	chain, _, _, key := NewTestBlockchain(true, nil)
-
-	key2, _ := crypto.GenerateKey()
-	addr := crypto.PubkeyToAddress(key.PublicKey)
-
-	txs := []txWithTimestamp{
-		{tx: tests.GetFullTx(1, 1, key, types.SendTx, nil, &addr, nil), timestamp: 10},
-		{tx: tests.GetFullTx(2, 1, key, types.SendTx, nil, &addr, nil), timestamp: 20},
-		{tx: tests.GetFullTx(4, 1, key, types.SendTx, nil, &addr, nil), timestamp: 30},
-		{tx: tests.GetFullTx(5, 1, key, types.SendTx, nil, &addr, nil), timestamp: 35},
-		{tx: tests.GetFullTx(6, 1, key, types.SendTx, nil, &addr, nil), timestamp: 50},
-		{tx: tests.GetFullTx(7, 1, key, types.SendTx, nil, &addr, nil), timestamp: 80},
-		{tx: tests.GetFullTx(9, 1, key, types.SendTx, nil, &addr, nil), timestamp: 80},
-		{tx: tests.GetFullTx(9, 1, key, types.SendTx, nil, &addr, nil), timestamp: 456},
-		{tx: tests.GetFullTx(10, 1, key, types.SendTx, nil, &addr, nil), timestamp: 456},
-		{tx: tests.GetFullTx(1, 2, key, types.SendTx, nil, &addr, nil), timestamp: 500},
-		{tx: tests.GetFullTx(2, 2, key, types.SendTx, nil, &addr, nil), timestamp: 500},
-
-		{tx: tests.GetFullTx(1, 1, key2, types.SendTx, nil, &addr, nil), timestamp: 20},
-		{tx: tests.GetFullTx(8, 1, key2, types.SendTx, nil, &addr, nil), timestamp: 80},
-		{tx: tests.GetFullTx(10, 1, key2, types.SendTx, nil, &addr, nil), timestamp: 80},
-		{tx: tests.GetFullTx(4, 1, key2, types.SendTx, nil, &addr, nil), timestamp: 456},
-	}
-
-	for _, item := range txs {
-		header := &types.Header{
-			ProposedHeader: &types.ProposedHeader{
-				Time:       new(big.Int).SetUint64(item.timestamp),
-				FeePerByte: big.NewInt(1),
-			},
-		}
-		chain.SaveTxs(header, []*types.Transaction{item.tx})
-	}
-
-	data, token := chain.ReadTxs(addr, 5, nil)
-
-	require.Equal(5, len(data))
-	require.Equal(uint32(2), data[0].Tx.AccountNonce)
-	require.Equal(uint32(1), data[1].Tx.AccountNonce)
-	require.Equal(uint32(10), data[2].Tx.AccountNonce)
-	require.Equal(uint32(9), data[3].Tx.AccountNonce)
-	require.Equal(uint32(4), data[4].Tx.AccountNonce)
-	require.Equal(uint64(456), data[4].Timestamp)
-	require.NotNil(token)
-
-	data, token = chain.ReadTxs(addr, 4, token)
-
-	require.Equal(4, len(data))
-	require.Equal(uint32(10), data[0].Tx.AccountNonce)
-	require.Equal(uint32(9), data[1].Tx.AccountNonce)
-	require.Equal(uint32(8), data[2].Tx.AccountNonce)
-	require.Equal(uint32(7), data[3].Tx.AccountNonce)
-	require.NotNil(token)
-
-	data, token = chain.ReadTxs(addr, 10, token)
-
-	require.Equal(6, len(data))
-	require.Equal(uint32(6), data[0].Tx.AccountNonce)
-	require.Equal(uint32(5), data[1].Tx.AccountNonce)
-	require.Equal(uint32(4), data[2].Tx.AccountNonce)
-	require.Equal(uint32(2), data[3].Tx.AccountNonce)
-	require.Equal(uint32(1), data[4].Tx.AccountNonce)
-	require.Equal(uint32(1), data[5].Tx.AccountNonce)
-	require.Equal(uint64(20), data[4].Timestamp)
-	require.Equal(uint64(10), data[5].Timestamp)
-	require.Nil(token)
 }
 
 func generateBlock(height uint64, txsCount int) *types.Block {
@@ -458,100 +418,292 @@ func Test_ApplyBurnTx(t *testing.T) {
 	expectedBalance := new(big.Int).Mul(big.NewInt(89), common.DnaBase)
 	expectedBalance.Sub(expectedBalance, fee)
 
-	chain.ApplyTxOnState(appState, signedTx)
+	chain.ApplyTxOnState(appState, signedTx, nil)
 
 	require.Equal(t, 1, fee.Sign())
 	require.Equal(t, expectedBalance, appState.State.GetBalance(sender))
 }
 
-func Test_Blockchain_SaveBurntCoins(t *testing.T) {
-	require := require.New(t)
+func Test_DeleteFlipTx(t *testing.T) {
+	senderKey, _ := crypto.GenerateKey()
+	balance := big.NewInt(1_000_000)
 
-	chain, _, _, key := NewTestBlockchain(true, nil)
-	chain.config.Blockchain.BurnTxRange = 3
-
-	key2, _ := crypto.GenerateKey()
-
-	createHeader := func(height uint64) *types.Header {
-		return &types.Header{
-			ProposedHeader: &types.ProposedHeader{
-				Height: height,
-				Time:   big.NewInt(0),
-			},
-		}
+	alloc := make(map[common.Address]config.GenesisAllocation)
+	sender := crypto.PubkeyToAddress(senderKey.PublicKey)
+	alloc[sender] = config.GenesisAllocation{
+		Balance: balance,
 	}
 
-	// Block height=1
-	chain.SaveTxs(createHeader(1), []*types.Transaction{
-		tests.GetFullTx(0, 0, key2, types.BurnTx, big.NewInt(3), nil,
-			attachments.CreateBurnAttachment("3")),
-		tests.GetFullTx(0, 0, key2, types.BurnTx, big.NewInt(4), nil,
-			attachments.CreateBurnAttachment("2")),
-		tests.GetFullTx(0, 0, key, types.BurnTx, big.NewInt(2), nil,
-			attachments.CreateBurnAttachment("1")),
-		tests.GetFullTx(0, 0, key, types.BurnTx, big.NewInt(3), nil,
-			attachments.CreateBurnAttachment("1")),
-	})
+	chain, _, _, _ := NewTestBlockchain(true, alloc)
 
+	tx := &types.Transaction{
+		Type:         types.DeleteFlipTx,
+		AccountNonce: 1,
+		Amount:       big.NewInt(100),
+		MaxFee:       big.NewInt(620_000),
+		Tips:         big.NewInt(10),
+		Payload:      attachments.CreateDeleteFlipAttachment([]byte{0x1, 0x2, 0x3}),
+	}
+	signedTx, _ := types.SignTx(tx, senderKey)
+
+	appState := chain.appState
+	appState.State.AddFlip(sender, []byte{0x1, 0x2, 0x2}, 0)
+	appState.State.AddFlip(sender, []byte{0x1, 0x2, 0x3}, 1)
+	appState.State.AddFlip(sender, []byte{0x1, 0x2, 0x4}, 2)
+	appState.State.SetFeePerByte(big.NewInt(1))
+
+	fee := fee2.CalculateFee(appState.ValidatorsCache.NetworkSize(), appState.State.FeePerByte(), tx)
+	expectedBalance := big.NewInt(999_990)
+	expectedBalance.Sub(expectedBalance, fee)
+
+	chain.ApplyTxOnState(appState, signedTx, nil)
+
+	require.Equal(t, 1, fee.Sign())
+	require.Equal(t, expectedBalance, appState.State.GetBalance(sender))
+	identity := appState.State.GetIdentity(sender)
+	require.Equal(t, 2, len(identity.Flips))
+}
+
+func Test_Blockchain_OnlineStatusSwitch(t *testing.T) {
+	require := require.New(t)
+	key, _ := crypto.GenerateKey()
 	addr := crypto.PubkeyToAddress(key.PublicKey)
-	addr2 := crypto.PubkeyToAddress(key2.PublicKey)
+	consensusCfg := config.GetDefaultConsensusConfig()
+	consensusCfg.Automine = true
+	consensusCfg.StatusSwitchRange = 10
+	cfg := &config.Config{
+		Network:   0x99,
+		Consensus: consensusCfg,
+		GenesisConf: &config.GenesisConf{
+			Alloc: map[common.Address]config.GenesisAllocation{
+				addr: {
+					State: uint8(state.Verified),
+				},
+			},
+			GodAddress:        addr,
+			FirstCeremonyTime: 4070908800, //01.01.2099
+		},
+		Validation: &config.ValidationConfig{},
+		Blockchain: &config.BlockchainConfig{},
+	}
+	chain, state := NewCustomTestBlockchainWithConfig(5, 0, key, cfg)
 
-	burntCoins := chain.ReadTotalBurntCoins()
-	require.Equal(3, len(burntCoins))
-	require.Equal(addr, burntCoins[0].Address)
-	require.Equal(big.NewInt(5), burntCoins[0].Amount)
+	//  add pending request to switch online
+	tx, _ := chain.secStore.SignTx(BuildTx(state, addr, nil, types.OnlineStatusTx, decimal.Zero, decimal.New(2, 0), decimal.Zero, 0, 0, attachments.CreateOnlineStatusAttachment(true)))
+	err := chain.txpool.Add(tx)
+	require.NoError(err)
 
-	require.Equal(addr2, burntCoins[1].Address)
-	require.Equal("2", burntCoins[1].Key)
-	require.Equal(big.NewInt(4), burntCoins[1].Amount)
+	// apply pending status switch
+	chain.GenerateBlocks(1)
+	require.Equal(1, len(state.State.StatusSwitchAddresses()))
+	require.False(state.IdentityState.IsOnline(addr))
 
-	require.Equal(addr2, burntCoins[2].Address)
-	require.Equal("3", burntCoins[2].Key)
-	require.Equal(big.NewInt(3), burntCoins[2].Amount)
+	// fail to switch online again
+	tx, _ = chain.secStore.SignTx(BuildTx(state, addr, nil, types.OnlineStatusTx, decimal.Zero, decimal.New(2, 0), decimal.Zero, 0, 0, attachments.CreateOnlineStatusAttachment(true)))
+	err = chain.txpool.Add(tx)
+	require.Error(err, "should not validate tx if switch is already pending")
 
-	// Block height=2
-	chain.SaveTxs(createHeader(2), []*types.Transaction{
-		tests.GetFullTx(0, 0, key2, types.BurnTx, big.NewInt(5), nil,
-			attachments.CreateBurnAttachment("2")),
-		tests.GetFullTx(0, 0, key, types.BurnTx, big.NewInt(1), nil,
-			attachments.CreateBurnAttachment("1")),
-		tests.GetFullTx(0, 0, key, types.SendTx, big.NewInt(2), nil, nil),
-	})
+	// switch status to online
+	chain.GenerateBlocks(3)
+	require.Equal(uint64(10), chain.Head.Height())
+	require.Zero(len(state.State.StatusSwitchAddresses()))
+	require.True(state.IdentityState.IsOnline(addr))
+	require.True(chain.Head.Flags().HasFlag(types.IdentityUpdate))
 
-	burntCoins = chain.ReadTotalBurntCoins()
-	require.Equal(3, len(burntCoins))
-	require.Equal(addr2, burntCoins[0].Address)
-	require.Equal(big.NewInt(9), burntCoins[0].Amount)
-	require.Equal("2", burntCoins[0].Key)
+	// fail to switch online again
+	chain.GenerateBlocks(5)
+	tx, _ = chain.secStore.SignTx(BuildTx(state, addr, nil, types.OnlineStatusTx, decimal.Zero, decimal.New(2, 0), decimal.Zero, 0, 0, attachments.CreateOnlineStatusAttachment(true)))
+	err = chain.txpool.Add(tx)
+	require.Error(err, "should not validate tx if identity already has online status")
 
-	require.Equal(addr, burntCoins[1].Address)
-	require.Equal(big.NewInt(6), burntCoins[1].Amount)
+	// add pending request to switch offline
+	chain.GenerateBlocks(4)
+	tx, _ = chain.secStore.SignTx(BuildTx(state, addr, nil, types.OnlineStatusTx, decimal.Zero, decimal.New(2, 0), decimal.Zero, 0, 0, attachments.CreateOnlineStatusAttachment(false)))
+	err = chain.txpool.Add(tx)
+	require.NoError(err)
 
-	require.Equal(addr2, burntCoins[2].Address)
-	require.Equal("3", burntCoins[2].Key)
-	require.Equal(big.NewInt(3), burntCoins[2].Amount)
+	// switch status to offline
+	chain.GenerateBlocks(1)
+	require.Equal(uint64(20), chain.Head.Height())
+	require.Zero(len(state.State.StatusSwitchAddresses()))
+	require.False(state.IdentityState.IsOnline(addr))
+	require.True(chain.Head.Flags().HasFlag(types.IdentityUpdate))
 
-	// Block height=4
-	chain.SaveTxs(createHeader(4), []*types.Transaction{
-		tests.GetFullTx(0, 0, key, types.BurnTx, big.NewInt(3), nil,
-			attachments.CreateBurnAttachment("1")),
-	})
+	// add pending request to switch offline
+	tx, _ = chain.secStore.SignTx(BuildTx(state, addr, nil, types.OnlineStatusTx, decimal.Zero, decimal.New(2, 0), decimal.Zero, 0, 0, attachments.CreateOnlineStatusAttachment(true)))
+	err = chain.txpool.Add(tx)
+	require.NoError(err)
+	chain.GenerateBlocks(1)
 
-	burntCoins = chain.ReadTotalBurntCoins()
-	require.Equal(2, len(burntCoins))
-	require.Equal(addr2, burntCoins[0].Address)
-	require.Equal(big.NewInt(5), burntCoins[0].Amount)
-	require.Equal(addr, burntCoins[1].Address)
-	require.Equal(big.NewInt(4), burntCoins[1].Amount)
+	require.Equal(1, len(state.State.StatusSwitchAddresses()))
 
-	// Block height=7
-	chain.SaveTxs(createHeader(7), []*types.Transaction{
-		tests.GetFullTx(0, 0, key, types.BurnTx, big.NewInt(1), nil,
-			attachments.CreateBurnAttachment("1")),
-	})
+	// remove pending request to switch online
+	tx, _ = chain.secStore.SignTx(BuildTx(state, addr, nil, types.OnlineStatusTx, decimal.Zero, decimal.New(2, 0), decimal.Zero, 0, 0, attachments.CreateOnlineStatusAttachment(false)))
+	err = chain.txpool.Add(tx)
+	require.NoError(err)
+	chain.GenerateBlocks(1)
 
-	burntCoins = chain.ReadTotalBurntCoins()
-	require.Equal(1, len(burntCoins))
-	require.Equal(addr, burntCoins[0].Address)
-	require.Equal(big.NewInt(1), burntCoins[0].Amount)
+	require.Zero(len(state.State.StatusSwitchAddresses()))
+
+	// 30th block should not update identity statuses, no pending requests
+	chain.GenerateBlocks(8)
+	require.Equal(uint64(30), chain.Head.Height())
+	require.False(state.IdentityState.IsOnline(addr))
+	require.False(chain.Head.Flags().HasFlag(types.IdentityUpdate))
+
+	chain.GenerateBlocks(70)
+	require.Equal(uint64(100), chain.Head.Height())
+}
+
+func Test_ApplySubmitCeremonyTxs(t *testing.T) {
+	key, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+	consensusCfg := config.GetDefaultConsensusConfig()
+	consensusCfg.Automine = true
+	consensusCfg.StatusSwitchRange = 10
+	cfg := &config.Config{
+		Network:   0x99,
+		Consensus: consensusCfg,
+		GenesisConf: &config.GenesisConf{
+			Alloc: map[common.Address]config.GenesisAllocation{
+				addr: {
+					State: uint8(state.Verified),
+				},
+			},
+			GodAddress:        addr,
+			FirstCeremonyTime: 1999999999,
+		},
+		Validation: &config.ValidationConfig{
+			ShortSessionDuration: 1 * time.Second,
+			LongSessionDuration:  1 * time.Second,
+		},
+		Blockchain: &config.BlockchainConfig{},
+	}
+	chain, app := NewCustomTestBlockchainWithConfig(0, 0, key, cfg)
+
+	app.State.SetValidationPeriod(state.LongSessionPeriod)
+	app.Commit(nil)
+
+	block := chain.GenerateEmptyBlock()
+	chain.Head = block.Header
+	chain.txpool.ResetTo(block)
+
+	tx := &types.Transaction{
+		Type:         types.SubmitAnswersHashTx,
+		AccountNonce: 1,
+		Epoch:        0,
+		Payload:      common.Hash{0x1}.Bytes(),
+	}
+
+	signed, err := types.SignTx(tx, key)
+	require.NoError(t, err)
+	err = chain.txpool.Add(signed)
+	require.NoError(t, err)
+
+	chain.GenerateBlocks(3)
+
+	require.True(t, app.State.HasValidationTx(addr, types.SubmitAnswersHashTx))
+	require.False(t, app.State.HasValidationTx(addr, types.SubmitShortAnswersTx))
+
+	tx = &types.Transaction{
+		Type:         types.EvidenceTx,
+		AccountNonce: 2,
+		Payload:      []byte{0x1},
+	}
+	signed, _ = types.SignTx(tx, key)
+	err = chain.txpool.Add(signed)
+	require.NoError(t, err)
+
+	chain.GenerateBlocks(1)
+	require.True(t, app.State.HasValidationTx(addr, types.SubmitAnswersHashTx))
+	require.True(t, app.State.HasValidationTx(addr, types.EvidenceTx))
+
+	tx = &types.Transaction{
+		Type:         types.EvidenceTx,
+		AccountNonce: 3,
+		Payload:      []byte{0x1},
+	}
+	signed, _ = types.SignTx(tx, key)
+
+	err = chain.txpool.Add(signed)
+	require.True(t, err == validation.DuplicatedTx)
+}
+
+func Test_Blockchain_GodAddressInvitesLimit(t *testing.T) {
+	require := require.New(t)
+	key, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+	chain, state := NewCustomTestBlockchain(5, 0, key)
+
+	count := int(common.GodAddressInvitesCount(0))
+	for i := 0; i < count; i++ {
+		keyReceiver, _ := crypto.GenerateKey()
+		receiver := crypto.PubkeyToAddress(keyReceiver.PublicKey)
+		tx, _ := chain.secStore.SignTx(BuildTx(state, addr, &receiver, types.InviteTx, decimal.Zero, decimal.New(2, 0), decimal.Zero, 0, 0, nil))
+		require.NoError(chain.txpool.Add(tx))
+		chain.GenerateBlocks(1)
+	}
+
+	keyReceiver, _ := crypto.GenerateKey()
+	receiver := crypto.PubkeyToAddress(keyReceiver.PublicKey)
+	tx, _ := chain.secStore.SignTx(BuildTx(state, addr, &receiver, types.InviteTx, decimal.Zero, decimal.New(2, 0), decimal.Zero, 0, 0, nil))
+	require.Equal(validation.InsufficientInvites, chain.txpool.Add(tx), "we should not issue invite if we exceed limit")
+}
+
+func Test_setNewIdentitiesAttributes(t *testing.T) {
+	require := require.New(t)
+	key, _ := crypto.GenerateKey()
+	_, s := NewCustomTestBlockchain(5, 0, key)
+
+	identities := []state.Identity{
+		{State: state.Human, ShortFlipPoints: 98, QualifiedFlips: 100},
+		{State: state.Verified, ShortFlipPoints: 83, QualifiedFlips: 100},
+		{State: state.Verified, ShortFlipPoints: 85, QualifiedFlips: 100},
+		{State: state.Verified, ShortFlipPoints: 88, QualifiedFlips: 100},
+		{State: state.Human, ShortFlipPoints: 92, QualifiedFlips: 100},
+		{State: state.Human, ShortFlipPoints: 94, QualifiedFlips: 100},
+		{State: state.Human, ShortFlipPoints: 94, QualifiedFlips: 100},
+		{State: state.Verified, ShortFlipPoints: 83, QualifiedFlips: 100},
+		{State: state.Verified, ShortFlipPoints: 82, QualifiedFlips: 100},
+		{State: state.Verified, ShortFlipPoints: 81, QualifiedFlips: 100},
+	}
+
+	for i, item := range identities {
+		addr := common.Address{byte(i + 1)}
+		s.State.SetState(addr, item.State)
+		s.State.AddShortFlipPoints(addr, float32(item.ShortFlipPoints))
+		s.State.AddQualifiedFlipsCount(addr, item.QualifiedFlips)
+	}
+	s.Commit(nil)
+
+	setNewIdentitiesAttributes(s, 12, 100, false, &types.ValidationAuthors{}, nil)
+
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x5}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x2}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x8}))
+
+	s.Reset()
+	setNewIdentitiesAttributes(s, 1, 100, false, &types.ValidationAuthors{}, nil)
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
+	require.Equal(uint8(0), s.State.GetInvites(common.Address{0x2}))
+
+	s.Reset()
+	setNewIdentitiesAttributes(s, 5, 100, false, &types.ValidationAuthors{}, nil)
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x6}))
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x7}))
+
+	s.Reset()
+	setNewIdentitiesAttributes(s, 14, 100, false, &types.ValidationAuthors{}, nil)
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xa}))
+
+	s.Reset()
+	setNewIdentitiesAttributes(s, 20, 100, false, &types.ValidationAuthors{}, nil)
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x6}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x4}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x9}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xa}))
 }

@@ -1,6 +1,6 @@
 package config
 
-import "gopkg.in/urfave/cli.v1"
+import "github.com/urfave/cli"
 
 const (
 	DefaultDataDir          = "datadir"
@@ -108,5 +108,9 @@ var (
 		Name:  "logfilesize",
 		Usage: "Set log file size in KB",
 		Value: 1024 * 10,
+	}
+	LogColoring = cli.BoolFlag{
+		Name:  "logcoloring",
+		Usage: "Use log coloring",
 	}
 )
